@@ -1,0 +1,5 @@
+DROP TABLE IF EXISTS now_playing;
+DROP TABLE IF EXISTS chat_messages;
+DROP TABLE IF EXISTS queue_entries;
+DROP TABLE IF EXISTS tracks;
+DROP TABLE IF EXISTS rooms;

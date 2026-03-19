@@ -1,0 +1,283 @@
+package handlers
+
+import (
+	"encoding/json"
+	"log"
+	"net/http"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+	"github.com/jukebox/backend/internal/middleware"
+	"github.com/jukebox/backend/internal/models"
+	"github.com/jukebox/backend/internal/playback"
+	"github.com/jukebox/backend/internal/store"
+	"github.com/jukebox/backend/internal/ws"
+)
+
+type AdminHandler struct {
+	pg       *store.PGStore
+	redis    *store.RedisStore
+	hubs     *ws.HubManager
+	playback *playback.SyncService
+}
+
+func NewAdminHandler(pg *store.PGStore, redis *store.RedisStore, hubs *ws.HubManager, pb *playback.SyncService) *AdminHandler {
+	return &AdminHandler{pg: pg, redis: redis, hubs: hubs, playback: pb}
+}
+
+// requireAdmin checks that the requesting user is an admin.
+func (h *AdminHandler) requireAdmin(r *http.Request) *models.User {
+	user := middleware.GetUser(r.Context())
+	if user == nil || !user.IsAdmin {
+		return nil
+	}
+	return user
+}
+
+// GET /api/admin/rooms — list all rooms with full details
+func (h *AdminHandler) ListRooms(w http.ResponseWriter, r *http.Request) {
+	if h.requireAdmin(r) == nil {
+		http.Error(w, "admin required", http.StatusForbidden)
+		return
+	}
+	ctx := r.Context()
+	rooms, err := h.pg.ListAllRooms(ctx)
+	if err != nil {
+		log.Printf("admin list rooms: %v", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	// Enrich with listener counts
+	for i := range rooms {
+		count, _ := h.redis.GetListenerCount(ctx, rooms[i].ID)
+		rooms[i].ListenerCount = int(count)
+	}
+
+	writeJSON(w, http.StatusOK, rooms)
+}
+
+// POST /api/admin/rooms — create an official room
+func (h *AdminHandler) CreateOfficialRoom(w http.ResponseWriter, r *http.Request) {
+	user := h.requireAdmin(r)
+	if user == nil {
+		http.Error(w, "admin required", http.StatusForbidden)
+		return
+	}
+
+	var req struct {
+		Name          string  `json:"name"`
+		Description   string  `json:"description"`
+		Genre         string  `json:"genre"`
+		Vibes         []string `json:"vibes"`
+		CoverArt      string  `json:"coverArt"`
+		CoverGradient string  `json:"coverGradient"`
+		RequestPolicy string  `json:"requestPolicy"`
+		ScheduledStart string `json:"scheduledStart,omitempty"`
+		ExpiresAt     string  `json:"expiresAt,omitempty"` // empty = eternal
+		IsFeatured    bool    `json:"isFeatured"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+	if req.Name == "" {
+		http.Error(w, "name required", http.StatusBadRequest)
+		return
+	}
+
+	djKey, djKeyHash, err := middleware.GenerateDJKey()
+	if err != nil {
+		http.Error(w, "key generation failed", http.StatusInternalServerError)
+		return
+	}
+
+	session := middleware.GetSession(r.Context())
+	slug := toSlug(req.Name) + "-" + time.Now().Format("0102")
+
+	vibes := req.Vibes
+	if vibes == nil {
+		vibes = []string{}
+	}
+
+	var scheduledStart *time.Time
+	if req.ScheduledStart != "" {
+		t, err := time.Parse(time.RFC3339, req.ScheduledStart)
+		if err == nil {
+			scheduledStart = &t
+		}
+	}
+
+	var expiresAt *time.Time
+	if req.ExpiresAt != "" {
+		t, err := time.Parse(time.RFC3339, req.ExpiresAt)
+		if err == nil {
+			expiresAt = &t
+		}
+	}
+
+	room := &models.Room{
+		ID:             uuid.New().String(),
+		Slug:           slug,
+		Name:           req.Name,
+		Description:    req.Description,
+		Genre:          req.Genre,
+		Vibes:          vibes,
+		CoverGradient:  req.CoverGradient,
+		CoverArtURL:    req.CoverArt,
+		RequestPolicy:  models.RequestPolicy(req.RequestPolicy),
+		IsLive:         false,
+		IsOfficial:     true,
+		IsFeatured:     req.IsFeatured,
+		DJKeyHash:      djKeyHash,
+		DJSessionID:    session.ID,
+		CreatedAt:      time.Now(),
+		ScheduledStart: scheduledStart,
+		ExpiresAt:      expiresAt,
+	}
+	if room.RequestPolicy == "" {
+		room.RequestPolicy = models.RequestPolicyOpen
+	}
+
+	if err := h.pg.CreateRoom(r.Context(), room); err != nil {
+		log.Printf("admin create room: %v", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	if req.IsFeatured {
+		h.pg.SetRoomFeatured(r.Context(), room.ID, true)
+	}
+
+	writeJSON(w, http.StatusCreated, map[string]interface{}{
+		"room":  room,
+		"djKey": djKey,
+	})
+}
+
+// POST /api/admin/rooms/{id}/shutdown — force-close any room
+func (h *AdminHandler) ShutdownRoom(w http.ResponseWriter, r *http.Request) {
+	if h.requireAdmin(r) == nil {
+		http.Error(w, "admin required", http.StatusForbidden)
+		return
+	}
+	roomID := chi.URLParam(r, "id")
+	ctx := r.Context()
+
+	room, err := h.pg.GetRoomByID(ctx, roomID)
+	if err != nil || room == nil {
+		http.Error(w, "room not found", http.StatusNotFound)
+		return
+	}
+
+	h.pg.EndRoom(ctx, room.ID)
+	h.pg.ClearNowPlaying(ctx, room.ID)
+	h.redis.ClearPlaybackState(ctx, room.ID)
+	h.redis.ClearListeners(ctx, room.ID)
+	h.playback.CancelAdvance(room.ID)
+
+	if hub := h.hubs.Get(room.ID); hub != nil {
+		hub.BroadcastJSON(ws.WSMessage{
+			Event:   "room_ended",
+			Payload: map[string]string{"reason": "Room was shut down by an administrator"},
+		})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "shutdown"})
+}
+
+// POST /api/admin/rooms/{id}/feature — set room as featured
+func (h *AdminHandler) SetFeatured(w http.ResponseWriter, r *http.Request) {
+	if h.requireAdmin(r) == nil {
+		http.Error(w, "admin required", http.StatusForbidden)
+		return
+	}
+	roomID := chi.URLParam(r, "id")
+	var req struct {
+		Featured bool `json:"featured"`
+	}
+	json.NewDecoder(r.Body).Decode(&req)
+
+	if err := h.pg.SetRoomFeatured(r.Context(), roomID, req.Featured); err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"featured": req.Featured})
+}
+
+// POST /api/admin/rooms/{id}/official — toggle official status
+func (h *AdminHandler) SetOfficial(w http.ResponseWriter, r *http.Request) {
+	if h.requireAdmin(r) == nil {
+		http.Error(w, "admin required", http.StatusForbidden)
+		return
+	}
+	roomID := chi.URLParam(r, "id")
+	var req struct {
+		Official bool `json:"official"`
+	}
+	json.NewDecoder(r.Body).Decode(&req)
+
+	if err := h.pg.SetRoomOfficial(r.Context(), roomID, req.Official); err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"official": req.Official})
+}
+
+// PATCH /api/admin/rooms/{id} — update room settings (expiry, schedule, etc)
+func (h *AdminHandler) UpdateRoom(w http.ResponseWriter, r *http.Request) {
+	if h.requireAdmin(r) == nil {
+		http.Error(w, "admin required", http.StatusForbidden)
+		return
+	}
+	roomID := chi.URLParam(r, "id")
+	var req struct {
+		ExpiresAt *string `json:"expiresAt"` // null = eternal
+	}
+	json.NewDecoder(r.Body).Decode(&req)
+
+	ctx := r.Context()
+	if req.ExpiresAt != nil {
+		if *req.ExpiresAt == "" {
+			h.pg.SetRoomExpiry(ctx, roomID, nil)
+		} else {
+			t, err := time.Parse(time.RFC3339, *req.ExpiresAt)
+			if err == nil {
+				h.pg.SetRoomExpiry(ctx, roomID, &t)
+			}
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "updated"})
+}
+
+// GET /api/admin/featured — get the current featured room (or auto-pick by listener count)
+func (h *AdminHandler) GetFeatured(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	// Check for manually featured room first
+	featured, _ := h.pg.GetFeaturedRoom(ctx)
+	if featured != nil {
+		count, _ := h.redis.GetListenerCount(ctx, featured.ID)
+		featured.ListenerCount = int(count)
+		writeJSON(w, http.StatusOK, featured)
+		return
+	}
+
+	// Auto-pick: live room with most listeners
+	rooms, _ := h.pg.ListRooms(ctx, true, "")
+	if len(rooms) == 0 {
+		writeJSON(w, http.StatusOK, nil)
+		return
+	}
+
+	best := &rooms[0]
+	for i := range rooms {
+		count, _ := h.redis.GetListenerCount(ctx, rooms[i].ID)
+		rooms[i].ListenerCount = int(count)
+		if rooms[i].ListenerCount > best.ListenerCount {
+			best = &rooms[i]
+		}
+	}
+	writeJSON(w, http.StatusOK, best)
+}
