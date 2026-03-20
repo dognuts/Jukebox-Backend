@@ -281,3 +281,100 @@ func (h *AdminHandler) GetFeatured(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, best)
 }
+
+// ==================== User Management ====================
+
+// GET /api/admin/users — list all users with optional search
+func (h *AdminHandler) ListUsers(w http.ResponseWriter, r *http.Request) {
+	if h.requireAdmin(r) == nil {
+		http.Error(w, "admin required", http.StatusForbidden)
+		return
+	}
+	query := r.URL.Query().Get("q")
+	users, err := h.pg.AdminListUsers(r.Context(), query)
+	if err != nil {
+		log.Printf("admin list users: %v", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, users)
+}
+
+// GET /api/admin/users/{id} — get full user details
+func (h *AdminHandler) GetUser(w http.ResponseWriter, r *http.Request) {
+	if h.requireAdmin(r) == nil {
+		http.Error(w, "admin required", http.StatusForbidden)
+		return
+	}
+	userID := chi.URLParam(r, "id")
+	user, err := h.pg.AdminGetUser(r.Context(), userID)
+	if err != nil || user == nil {
+		http.Error(w, "user not found", http.StatusNotFound)
+		return
+	}
+	writeJSON(w, http.StatusOK, user)
+}
+
+// PATCH /api/admin/users/{id} — update user fields (ban, verify, set admin, reset neon, etc.)
+func (h *AdminHandler) UpdateUser(w http.ResponseWriter, r *http.Request) {
+	if h.requireAdmin(r) == nil {
+		http.Error(w, "admin required", http.StatusForbidden)
+		return
+	}
+	userID := chi.URLParam(r, "id")
+
+	var req struct {
+		IsAdmin       *bool   `json:"isAdmin,omitempty"`
+		IsBanned      *bool   `json:"isBanned,omitempty"`
+		EmailVerified *bool   `json:"emailVerified,omitempty"`
+		IsPlus        *bool   `json:"isPlus,omitempty"`
+		NeonBalance   *int    `json:"neonBalance,omitempty"`
+		DisplayName   *string `json:"displayName,omitempty"`
+		StageName     *string `json:"stageName,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	ctx := r.Context()
+	if req.IsAdmin != nil {
+		h.pg.AdminSetField(ctx, userID, "is_admin", *req.IsAdmin)
+	}
+	if req.IsBanned != nil {
+		h.pg.AdminSetField(ctx, userID, "is_banned", *req.IsBanned)
+	}
+	if req.EmailVerified != nil {
+		h.pg.AdminSetField(ctx, userID, "email_verified", *req.EmailVerified)
+	}
+	if req.IsPlus != nil {
+		h.pg.AdminSetField(ctx, userID, "is_plus", *req.IsPlus)
+	}
+	if req.NeonBalance != nil {
+		h.pg.AdminSetField(ctx, userID, "neon_balance", *req.NeonBalance)
+	}
+	if req.DisplayName != nil {
+		h.pg.AdminSetField(ctx, userID, "display_name", *req.DisplayName)
+	}
+	if req.StageName != nil {
+		h.pg.AdminSetField(ctx, userID, "stage_name", *req.StageName)
+	}
+
+	user, _ := h.pg.AdminGetUser(ctx, userID)
+	writeJSON(w, http.StatusOK, user)
+}
+
+// DELETE /api/admin/users/{id} — delete a user account
+func (h *AdminHandler) DeleteUser(w http.ResponseWriter, r *http.Request) {
+	if h.requireAdmin(r) == nil {
+		http.Error(w, "admin required", http.StatusForbidden)
+		return
+	}
+	userID := chi.URLParam(r, "id")
+	if err := h.pg.AdminDeleteUser(r.Context(), userID); err != nil {
+		log.Printf("admin delete user: %v", err)
+		http.Error(w, "failed to delete user", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}

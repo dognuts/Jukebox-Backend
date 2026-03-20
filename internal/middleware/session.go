@@ -65,7 +65,8 @@ func SessionMiddleware(redis *store.RedisStore) func(http.Handler) http.Handler 
 					Value:    session.ID,
 					Path:     "/",
 					HttpOnly: true,
-					SameSite: http.SameSiteLaxMode,
+					SameSite: http.SameSiteNoneMode,
+					Secure:   true,
 					MaxAge:   int(24 * time.Hour / time.Second),
 				})
 			}

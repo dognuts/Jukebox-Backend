@@ -138,6 +138,7 @@ type User struct {
 	PlusExpiresAt  *time.Time `json:"plusExpiresAt,omitempty"`
 	NeonBalance    int       `json:"neonBalance"`
 	StripeCustomerID string  `json:"-"`
+	IsBanned         bool    `json:"isBanned"`
 }
 
 type EmailVerification struct {

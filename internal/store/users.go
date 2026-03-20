@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -186,6 +187,94 @@ func (s *PGStore) CleanupExpiredTokens(ctx context.Context) error {
 func (s *PGStore) BootstrapAdmin(ctx context.Context, email string) error {
 	_, err := s.pool.Exec(ctx,
 		`UPDATE users SET is_admin = true WHERE email = $1`, email)
+	return err
+}
+
+// ==================== Admin User Management ====================
+
+// AdminListUsers returns all users, optionally filtered by search query.
+func (s *PGStore) AdminListUsers(ctx context.Context, query string) ([]models.User, error) {
+	var sql string
+	var args []interface{}
+	if query != "" {
+		sql = `SELECT id, email, display_name, stage_name, avatar_color, bio, city, region, country,
+			email_verified, is_admin, is_plus, neon_balance, created_at, is_banned
+			FROM users
+			WHERE email ILIKE $1 OR display_name ILIKE $1 OR stage_name ILIKE $1
+			ORDER BY created_at DESC LIMIT 100`
+		args = []interface{}{"%" + query + "%"}
+	} else {
+		sql = `SELECT id, email, display_name, stage_name, avatar_color, bio, city, region, country,
+			email_verified, is_admin, is_plus, neon_balance, created_at, is_banned
+			FROM users
+			ORDER BY created_at DESC LIMIT 100`
+	}
+	rows, err := s.pool.Query(ctx, sql, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var users []models.User
+	for rows.Next() {
+		var u models.User
+		var isBanned bool
+		err := rows.Scan(&u.ID, &u.Email, &u.DisplayName, &u.StageName, &u.AvatarColor,
+			&u.Bio, &u.City, &u.Region, &u.Country,
+			&u.EmailVerified, &u.IsAdmin, &u.IsPlus, &u.NeonBalance, &u.CreatedAt, &isBanned)
+		if err != nil {
+			return nil, err
+		}
+		u.IsBanned = isBanned
+		users = append(users, u)
+	}
+	return users, nil
+}
+
+// AdminGetUser returns a single user by ID with all fields.
+func (s *PGStore) AdminGetUser(ctx context.Context, userID string) (*models.User, error) {
+	var u models.User
+	var isBanned bool
+	err := s.pool.QueryRow(ctx,
+		`SELECT id, email, display_name, stage_name, avatar_color, bio, city, region, country,
+			email_verified, is_admin, is_plus, neon_balance, created_at, is_banned
+		FROM users WHERE id = $1`, userID).Scan(
+		&u.ID, &u.Email, &u.DisplayName, &u.StageName, &u.AvatarColor,
+		&u.Bio, &u.City, &u.Region, &u.Country,
+		&u.EmailVerified, &u.IsAdmin, &u.IsPlus, &u.NeonBalance, &u.CreatedAt, &isBanned)
+	if err != nil {
+		return nil, err
+	}
+	u.IsBanned = isBanned
+	return &u, nil
+}
+
+// AdminSetField updates a single column on a user record.
+func (s *PGStore) AdminSetField(ctx context.Context, userID, field string, value interface{}) error {
+	// Allowlist of fields to prevent SQL injection
+	allowed := map[string]bool{
+		"is_admin": true, "is_banned": true, "email_verified": true,
+		"is_plus": true, "neon_balance": true, "display_name": true, "stage_name": true,
+	}
+	if !allowed[field] {
+		return fmt.Errorf("field not allowed: %s", field)
+	}
+	_, err := s.pool.Exec(ctx,
+		`UPDATE users SET `+field+` = $2 WHERE id = $1`, userID, value)
+	return err
+}
+
+// AdminDeleteUser removes a user and their associated data.
+func (s *PGStore) AdminDeleteUser(ctx context.Context, userID string) error {
+	// Delete in order of dependencies
+	_, _ = s.pool.Exec(ctx, `DELETE FROM chat_messages WHERE session_id IN (SELECT id FROM users WHERE id = $1)`, userID)
+	_, _ = s.pool.Exec(ctx, `DELETE FROM direct_messages WHERE from_user_id = $1 OR to_user_id = $1`, userID)
+	_, _ = s.pool.Exec(ctx, `DELETE FROM listen_events WHERE user_id = $1`, userID)
+	_, _ = s.pool.Exec(ctx, `DELETE FROM playlist_tracks WHERE playlist_id IN (SELECT id FROM playlists WHERE user_id = $1)`, userID)
+	_, _ = s.pool.Exec(ctx, `DELETE FROM playlists WHERE user_id = $1`, userID)
+	_, _ = s.pool.Exec(ctx, `DELETE FROM neon_transactions WHERE from_user_id = $1 OR to_user_id = $1`, userID)
+	_, _ = s.pool.Exec(ctx, `DELETE FROM subscriptions WHERE user_id = $1`, userID)
+	_, err := s.pool.Exec(ctx, `DELETE FROM users WHERE id = $1`, userID)
 	return err
 }
 

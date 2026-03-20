@@ -83,6 +83,7 @@ func main() {
 	plH := handlers.NewPlaylistHandler(pg)
 	adminH := handlers.NewAdminHandler(pg, redis, hubMgr, syncSvc)
 	monH := handlers.NewMonetizationHandler(pg, hubMgr)
+	lkH := handlers.NewLiveKitHandler(cfg)
 
 	// ---------- Router ----------
 
@@ -175,6 +176,12 @@ func main() {
 		r.Post("/admin/rooms/{id}/feature", adminH.SetFeatured)
 		r.Post("/admin/rooms/{id}/official", adminH.SetOfficial)
 
+		// Admin user management
+		r.Get("/admin/users", adminH.ListUsers)
+		r.Get("/admin/users/{id}", adminH.GetUser)
+		r.Patch("/admin/users/{id}", adminH.UpdateUser)
+		r.Delete("/admin/users/{id}", adminH.DeleteUser)
+
 		// Featured room (public)
 		r.Get("/featured", adminH.GetFeatured)
 
@@ -193,6 +200,9 @@ func main() {
 		r.Post("/billing/neon/send", monH.SendNeon)
 		r.Get("/rooms/{roomId}/tube", monH.GetTubeState)
 		r.Post("/admin/pool/compute", monH.ComputePool)
+
+		// LiveKit voice
+		r.Post("/livekit/token", lkH.GetToken)
 	})
 
 	// WebSocket

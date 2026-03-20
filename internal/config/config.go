@@ -24,6 +24,9 @@ type Config struct {
 	StripeSecretKey    string
 	StripeWebhookSecret string
 	StripePlusPriceID  string
+	LiveKitURL       string
+	LiveKitAPIKey    string
+	LiveKitAPISecret string
 }
 
 func Load() *Config {
@@ -51,6 +54,9 @@ func Load() *Config {
 		StripeSecretKey:    getEnv("STRIPE_SECRET_KEY", ""),
 		StripeWebhookSecret: getEnv("STRIPE_WEBHOOK_SECRET", ""),
 		StripePlusPriceID:  getEnv("STRIPE_PLUS_PRICE_ID", ""),
+		LiveKitURL:       getEnv("LIVEKIT_URL", ""),
+		LiveKitAPIKey:    getEnv("LIVEKIT_API_KEY", ""),
+		LiveKitAPISecret: getEnv("LIVEKIT_API_SECRET", ""),
 	}
 }
 

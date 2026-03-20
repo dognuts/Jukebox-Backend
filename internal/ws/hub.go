@@ -501,6 +501,28 @@ func (h *Hub) handleInbound(cm *ClientMessage) {
 			Payload: map[string]string{"reason": "DJ ended the session"},
 		})
 
+	case ActionDJMic:
+		if !client.IsDJ {
+			client.sendError("DJ key required")
+			return
+		}
+		var micPayload struct {
+			Active     bool `json:"active"`
+			PauseMusic bool `json:"pauseMusic"`
+		}
+		if err := json.Unmarshal(msg.Payload, &micPayload); err != nil {
+			client.sendError("invalid mic payload")
+			return
+		}
+		h.broadcastJSON(WSMessage{
+			Event: EventDJMicState,
+			Payload: map[string]interface{}{
+				"active":     micPayload.Active,
+				"pauseMusic": micPayload.PauseMusic,
+				"djName":     client.DisplayName(),
+			},
+		})
+
 	default:
 		client.sendError("unknown action: " + msg.Action)
 	}
@@ -571,6 +593,7 @@ func (h *Hub) broadcastListenerList() {
 		Username    string `json:"username"`
 		AvatarColor string `json:"avatarColor"`
 		IsDJ        bool   `json:"isDJ"`
+		UserID      string `json:"userId,omitempty"`
 	}
 	var listeners []listenerInfo
 	seen := map[string]bool{}
@@ -584,6 +607,7 @@ func (h *Hub) broadcastListenerList() {
 			Username:    name,
 			AvatarColor: client.Session.AvatarColor,
 			IsDJ:        client.IsDJ,
+			UserID:      client.UserID,
 		})
 	}
 	h.mu.RUnlock()

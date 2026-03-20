@@ -31,6 +31,10 @@ const (
 	ActionDJAnnounce  = "dj_announce"
 	ActionDJGoLive    = "dj_go_live"
 	ActionDJEndRoom   = "dj_end_session"
+	ActionDJMic       = "dj_mic"
+
+	// DJ mic state broadcast
+	EventDJMicState = "dj_mic_state"
 )
 
 // WSMessage is the envelope for all server -> client WebSocket communication.
