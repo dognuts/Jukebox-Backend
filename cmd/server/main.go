@@ -154,6 +154,7 @@ func main() {
 		r.Post("/rooms/{slug}/queue", queueH.SubmitTrack)
 		r.Get("/rooms/{slug}/requests", queueH.GetPendingRequests)
 		r.Get("/rooms/{slug}/history", roomH.GetHistory)
+		r.Get("/rooms/{slug}/autoplay-tracks", roomH.GetAutoplayTracks)
 		r.Post("/rooms/{slug}/save-session", roomH.SaveSession)
 
 		// Direct Messages (requires login)

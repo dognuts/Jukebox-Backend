@@ -423,6 +423,30 @@ func (h *RoomHandler) SaveSession(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// GET /api/rooms/{slug}/autoplay-tracks — public endpoint for autoplay playlist
+func (h *RoomHandler) GetAutoplayTracks(w http.ResponseWriter, r *http.Request) {
+	slug := chi.URLParam(r, "slug")
+	room, err := h.pg.GetRoomBySlug(r.Context(), slug)
+	if err != nil || room == nil {
+		http.Error(w, "room not found", http.StatusNotFound)
+		return
+	}
+	if !room.IsAutoplay {
+		writeJSON(w, http.StatusOK, map[string]interface{}{"tracks": []interface{}{}, "currentIndex": 0})
+		return
+	}
+	playlist, err := h.pg.GetAutoplayPlaylist(r.Context(), room.ID, "live")
+	if err != nil || playlist == nil {
+		writeJSON(w, http.StatusOK, map[string]interface{}{"tracks": []interface{}{}, "currentIndex": 0})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"tracks":       playlist.Tracks,
+		"currentIndex": playlist.CurrentIndex,
+		"name":         playlist.Name,
+	})
+}
+
 // Helper
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
