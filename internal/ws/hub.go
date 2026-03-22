@@ -26,6 +26,9 @@ type Hub struct {
 
 	pg    *store.PGStore
 	redis *store.RedisStore
+
+	// OnAutoplayEnd is called when a listener reports the autoplay track ended
+	OnAutoplayEnd func(roomID string)
 }
 
 // NewHub creates a hub for the given room.
@@ -523,6 +526,12 @@ func (h *Hub) handleInbound(cm *ClientMessage) {
 			},
 		})
 
+	case ActionAutoplayEnd:
+		// Any listener can report that the autoplay track ended
+		if h.OnAutoplayEnd != nil {
+			go h.OnAutoplayEnd(h.RoomID)
+		}
+
 	default:
 		client.sendError("unknown action: " + msg.Action)
 	}
@@ -639,6 +648,9 @@ type HubManager struct {
 	mu    sync.RWMutex
 	pg    *store.PGStore
 	redis *store.RedisStore
+
+	// OnAutoplayEnd is set by the SyncService to handle autoplay track endings
+	OnAutoplayEnd func(roomID string)
 }
 
 func NewHubManager(pg *store.PGStore, redis *store.RedisStore) *HubManager {
@@ -659,6 +671,7 @@ func (m *HubManager) GetOrCreate(roomID, roomSlug string) *Hub {
 	}
 
 	hub := NewHub(roomID, roomSlug, m.pg, m.redis)
+	hub.OnAutoplayEnd = m.OnAutoplayEnd
 	m.hubs[roomID] = hub
 	go hub.Run()
 	return hub

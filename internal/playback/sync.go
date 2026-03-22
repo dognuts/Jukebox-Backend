@@ -15,20 +15,27 @@ import (
 
 // SyncService monitors playback state and auto-advances tracks when they finish.
 type SyncService struct {
-	pg     *store.PGStore
-	redis  *store.RedisStore
-	hubs   *ws.HubManager
-	timers map[string]*time.Timer // roomID -> timer
-	mu     sync.Mutex
+	pg          *store.PGStore
+	redis       *store.RedisStore
+	hubs        *ws.HubManager
+	timers      map[string]*time.Timer // roomID -> timer
+	lastAdvance map[string]time.Time   // roomID -> last advance time (debounce)
+	mu          sync.Mutex
 }
 
 func NewSyncService(pg *store.PGStore, redis *store.RedisStore, hubs *ws.HubManager) *SyncService {
-	return &SyncService{
-		pg:     pg,
-		redis:  redis,
-		hubs:   hubs,
-		timers: make(map[string]*time.Timer),
+	s := &SyncService{
+		pg:          pg,
+		redis:       redis,
+		hubs:        hubs,
+		timers:      make(map[string]*time.Timer),
+		lastAdvance: make(map[string]time.Time),
 	}
+	// Wire up the autoplay end callback so listeners can trigger track advance
+	hubs.OnAutoplayEnd = func(roomID string) {
+		s.advanceTrack(roomID)
+	}
+	return s
 }
 
 // ScheduleAdvance sets a timer to advance to the next track when the current one ends.
@@ -46,11 +53,18 @@ func (s *SyncService) ScheduleAdvance(roomID string, track *models.Track, starte
 		return
 	}
 
-	// If duration is 0 (unknown, e.g. YouTube embeds), don't schedule auto-advance.
-	// The client's audio player will fire onTrackEnd when it actually finishes.
+	// If duration is 0 (unknown, e.g. YouTube embeds), use a fallback for autoplay rooms.
+	// For DJ rooms, the client will fire onTrackEnd.
 	if track.Duration <= 0 {
-		log.Printf("[playback] room %s: track has unknown duration, skipping auto-advance", roomID)
-		return
+		// Check if this is an autoplay room — use 10 minute fallback
+		room, _ := s.pg.GetRoomByID(context.Background(), roomID)
+		if room != nil && room.IsAutoplay {
+			track.Duration = 600 // 10 minute fallback
+			log.Printf("[playback] room %s: autoplay track has no duration, using 600s fallback", roomID)
+		} else {
+			log.Printf("[playback] room %s: track has unknown duration, skipping auto-advance", roomID)
+			return
+		}
 	}
 
 	// Calculate when the track ends
@@ -83,6 +97,20 @@ func (s *SyncService) CancelAdvance(roomID string) {
 }
 
 func (s *SyncService) advanceTrack(roomID string) {
+	// Debounce: ignore if we advanced this room within the last 3 seconds
+	s.mu.Lock()
+	if last, ok := s.lastAdvance[roomID]; ok && time.Since(last) < 3*time.Second {
+		s.mu.Unlock()
+		return
+	}
+	s.lastAdvance[roomID] = time.Now()
+	// Cancel any pending timer for this room since we're advancing now
+	if t, ok := s.timers[roomID]; ok {
+		t.Stop()
+		delete(s.timers, roomID)
+	}
+	s.mu.Unlock()
+
 	ctx := context.Background()
 
 	hub := s.hubs.Get(roomID)
