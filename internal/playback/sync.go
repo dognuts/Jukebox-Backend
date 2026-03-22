@@ -156,6 +156,13 @@ func (s *SyncService) advanceAutoplay(ctx context.Context, roomID string, hub *w
 		CreatedAt:     time.Now(),
 	}
 
+	// Insert into tracks table so GetNowPlaying JOIN works
+	if err := s.pg.UpsertTrack(ctx, track); err != nil {
+		log.Printf("[autoplay] room %s: failed to upsert track: %v", roomID, err)
+	}
+
+	s.pg.SetNowPlaying(ctx, roomID, track.ID)
+
 	ps := &models.PlaybackState{
 		RoomID:        roomID,
 		TrackID:       track.ID,
