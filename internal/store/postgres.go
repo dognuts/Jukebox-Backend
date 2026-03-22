@@ -211,6 +211,12 @@ func (s *PGStore) UpsertTrack(ctx context.Context, t *models.Track) error {
 	return err
 }
 
+func (s *PGStore) UpdateTrackDuration(ctx context.Context, trackID string, duration int) error {
+	_, err := s.pool.Exec(ctx,
+		`UPDATE tracks SET duration = $2 WHERE id = $1 AND duration = 0`, trackID, duration)
+	return err
+}
+
 func (s *PGStore) GetTrack(ctx context.Context, id string) (*models.Track, error) {
 	t := &models.Track{}
 	err := s.pool.QueryRow(ctx, `

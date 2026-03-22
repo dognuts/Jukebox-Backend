@@ -35,6 +35,10 @@ func NewSyncService(pg *store.PGStore, redis *store.RedisStore, hubs *ws.HubMana
 	hubs.OnAutoplayEnd = func(roomID string) {
 		s.advanceTrack(roomID)
 	}
+	// Wire up duration reporting so autoplay timers use real durations
+	hubs.OnReportDuration = func(roomID string, trackID string, duration int) {
+		s.handleDurationReport(roomID, trackID, duration)
+	}
 	return s
 }
 
@@ -97,19 +101,12 @@ func (s *SyncService) CancelAdvance(roomID string) {
 }
 
 func (s *SyncService) advanceTrack(roomID string) {
-	// Debounce: ignore if we advanced this room recently
+	// Debounce: ignore if we advanced this room within the last 10 seconds
 	s.mu.Lock()
-	if last, ok := s.lastAdvance[roomID]; ok {
-		// For autoplay rooms, use a longer debounce to prevent rapid cycling
-		room, _ := s.pg.GetRoomByID(context.Background(), roomID)
-		minGap := 3 * time.Second
-		if room != nil && room.IsAutoplay {
-			minGap = 10 * time.Second
-		}
-		if time.Since(last) < minGap {
-			s.mu.Unlock()
-			return
-		}
+	if last, ok := s.lastAdvance[roomID]; ok && time.Since(last) < 10*time.Second {
+		log.Printf("[playback] room %s: debounce blocked advance (last advance %v ago)", roomID, time.Since(last))
+		s.mu.Unlock()
+		return
 	}
 	s.lastAdvance[roomID] = time.Now()
 	// Cancel any pending timer for this room since we're advancing now
@@ -214,6 +211,31 @@ func (s *SyncService) advanceAutoplay(ctx context.Context, roomID string, hub *w
 	s.ScheduleAdvance(roomID, track, ps.StartedAtUnix)
 
 	log.Printf("[autoplay] room %s now playing [%d]: %s - %s", roomID, idx, track.Artist, track.Title)
+}
+
+// handleDurationReport updates the track duration and reschedules the advance timer.
+func (s *SyncService) handleDurationReport(roomID, trackID string, duration int) {
+	if duration <= 0 {
+		return
+	}
+	ctx := context.Background()
+
+	// Update the track in the DB
+	if err := s.pg.UpdateTrackDuration(ctx, trackID, duration); err != nil {
+		log.Printf("[playback] failed to update track duration: %v", err)
+		return
+	}
+
+	// Check if this is the currently playing track
+	ps, _ := s.redis.GetPlaybackState(ctx, roomID)
+	if ps == nil || ps.TrackID != trackID || !ps.IsPlaying {
+		return
+	}
+
+	// Reschedule the advance timer with the real duration
+	track := &models.Track{ID: trackID, Duration: duration}
+	s.ScheduleAdvance(roomID, track, ps.StartedAtUnix)
+	log.Printf("[playback] room %s: updated track duration to %ds, rescheduled advance", roomID, duration)
 }
 
 func (s *SyncService) Stop() {

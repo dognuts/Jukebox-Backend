@@ -33,6 +33,7 @@ const (
 	ActionDJEndRoom   = "dj_end_session"
 	ActionDJMic       = "dj_mic"
 	ActionAutoplayEnd = "autoplay_track_ended"
+	ActionReportDuration = "report_duration"
 
 	// DJ mic state broadcast
 	EventDJMicState = "dj_mic_state"
