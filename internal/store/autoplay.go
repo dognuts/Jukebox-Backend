@@ -170,8 +170,8 @@ func (s *PGStore) SetRoomAutoplay(ctx context.Context, roomID string, autoplay b
 // CreateAutoplayRoom inserts a new room with is_autoplay = true.
 func (s *PGStore) CreateAutoplayRoom(ctx context.Context, room *models.Room) error {
 	_, err := s.pool.Exec(ctx,
-		`INSERT INTO rooms (id, slug, name, description, genre, cover_gradient, request_policy, is_live, is_official, is_autoplay, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+		`INSERT INTO rooms (id, slug, name, description, genre, cover_gradient, request_policy, is_live, is_official, is_autoplay, created_at, dj_key_hash, dj_session_id, dj_display_name)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, '', '', '24/7 Radio')`,
 		room.ID, room.Slug, room.Name, room.Description, room.Genre, room.CoverGradient,
 		room.RequestPolicy, room.IsLive, room.IsOfficial, room.IsAutoplay, room.CreatedAt)
 	return err
