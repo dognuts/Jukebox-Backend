@@ -378,3 +378,152 @@ func (h *AdminHandler) DeleteUser(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
+
+// ==================== Autoplay Room Management ====================
+
+// POST /api/admin/autoplay/rooms — create a new autoplay room
+func (h *AdminHandler) CreateAutoplayRoom(w http.ResponseWriter, r *http.Request) {
+	if h.requireAdmin(r) == nil {
+		http.Error(w, "admin required", http.StatusForbidden)
+		return
+	}
+	var req struct {
+		Name        string `json:"name"`
+		Description string `json:"description"`
+		Genre       string `json:"genre"`
+		CoverGradient string `json:"coverGradient"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Name == "" {
+		http.Error(w, "name required", http.StatusBadRequest)
+		return
+	}
+
+	ctx := r.Context()
+	slug := toSlug(req.Name)
+	roomID := uuid.New().String()
+
+	room := &models.Room{
+		ID:            roomID,
+		Slug:          slug,
+		Name:          req.Name,
+		Description:   req.Description,
+		Genre:         req.Genre,
+		CoverGradient: req.CoverGradient,
+		RequestPolicy: models.RequestPolicyClosed,
+		IsLive:        false, // not live until playlist is activated
+		IsOfficial:    true,
+		IsAutoplay:    true,
+		CreatedAt:     time.Now(),
+	}
+
+	if err := h.pg.CreateAutoplayRoom(ctx, room); err != nil {
+		log.Printf("admin create autoplay room: %v", err)
+		http.Error(w, "failed to create room", http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, room)
+}
+
+// GET /api/admin/autoplay/rooms/{id}/playlists — get live and staged playlists
+func (h *AdminHandler) GetAutoplayPlaylists(w http.ResponseWriter, r *http.Request) {
+	if h.requireAdmin(r) == nil {
+		http.Error(w, "admin required", http.StatusForbidden)
+		return
+	}
+	roomID := chi.URLParam(r, "id")
+	playlists, err := h.pg.GetAutoplayPlaylists(r.Context(), roomID)
+	if err != nil {
+		http.Error(w, "failed to load playlists", http.StatusInternalServerError)
+		return
+	}
+	if playlists == nil {
+		playlists = []models.AutoplayPlaylist{}
+	}
+	writeJSON(w, http.StatusOK, playlists)
+}
+
+// PUT /api/admin/autoplay/rooms/{id}/staged — save the staged (next) playlist
+func (h *AdminHandler) SaveStagedPlaylist(w http.ResponseWriter, r *http.Request) {
+	if h.requireAdmin(r) == nil {
+		http.Error(w, "admin required", http.StatusForbidden)
+		return
+	}
+	roomID := chi.URLParam(r, "id")
+
+	var req struct {
+		Name   string                  `json:"name"`
+		Tracks []models.AutoplayTrack  `json:"tracks"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	playlist := &models.AutoplayPlaylist{
+		RoomID:    roomID,
+		Status:    "staged",
+		Name:      req.Name,
+		Tracks:    req.Tracks,
+		CreatedAt: time.Now(),
+	}
+	if err := h.pg.SaveAutoplayPlaylist(r.Context(), playlist); err != nil {
+		log.Printf("save staged playlist: %v", err)
+		http.Error(w, "failed to save", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, playlist)
+}
+
+// POST /api/admin/autoplay/rooms/{id}/activate — promote staged to live
+func (h *AdminHandler) ActivatePlaylist(w http.ResponseWriter, r *http.Request) {
+	if h.requireAdmin(r) == nil {
+		http.Error(w, "admin required", http.StatusForbidden)
+		return
+	}
+	roomID := chi.URLParam(r, "id")
+	ctx := r.Context()
+
+	playlist, err := h.pg.ActivateStagedPlaylist(ctx, roomID)
+	if err != nil || playlist == nil {
+		log.Printf("activate playlist: %v", err)
+		http.Error(w, "failed to activate — is there a staged playlist?", http.StatusBadRequest)
+		return
+	}
+
+	// Mark room as live and autoplay
+	h.pg.SetRoomAutoplay(ctx, roomID, true)
+
+	// Start playing the first track
+	h.playback.StartAutoplayRooms(ctx)
+
+	writeJSON(w, http.StatusOK, playlist)
+}
+
+// DELETE /api/admin/autoplay/rooms/{id}/staged — delete the staged playlist
+func (h *AdminHandler) DeleteStagedPlaylist(w http.ResponseWriter, r *http.Request) {
+	if h.requireAdmin(r) == nil {
+		http.Error(w, "admin required", http.StatusForbidden)
+		return
+	}
+	roomID := chi.URLParam(r, "id")
+	h.pg.DeleteAutoplayPlaylist(r.Context(), roomID, "staged")
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+// POST /api/admin/autoplay/rooms/{id}/stop — stop an autoplay room
+func (h *AdminHandler) StopAutoplayRoom(w http.ResponseWriter, r *http.Request) {
+	if h.requireAdmin(r) == nil {
+		http.Error(w, "admin required", http.StatusForbidden)
+		return
+	}
+	roomID := chi.URLParam(r, "id")
+	ctx := r.Context()
+
+	h.pg.SetRoomAutoplay(ctx, roomID, false)
+	h.playback.CancelAdvance(roomID)
+	h.redis.ClearPlaybackState(ctx, roomID)
+	h.pg.ClearNowPlaying(ctx, roomID)
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "stopped"})
+}

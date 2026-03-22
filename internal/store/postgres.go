@@ -75,7 +75,7 @@ func (s *PGStore) RunMigrations(ctx context.Context, migrationsDir string) error
 const roomColumns = `id, slug, name, description, genre, vibes, cover_gradient,
 	cover_art_url, request_policy, is_live, is_official, dj_key_hash,
 	dj_session_id, created_at, scheduled_start, last_active_at,
-	ended_at, expires_at, is_featured, dj_display_name, creator_user_id`
+	ended_at, expires_at, is_featured, dj_display_name, creator_user_id, is_autoplay`
 
 // scanRoom scans a row into a models.Room. Column order must match roomColumns.
 func scanRoom(scanner interface{ Scan(dest ...any) error }) (models.Room, error) {
@@ -85,7 +85,7 @@ func scanRoom(scanner interface{ Scan(dest ...any) error }) (models.Room, error)
 		&r.CoverGradient, &r.CoverArtURL, &r.RequestPolicy, &r.IsLive,
 		&r.IsOfficial, &r.DJKeyHash, &r.DJSessionID, &r.CreatedAt,
 		&r.ScheduledStart, &r.LastActiveAt, &r.EndedAt, &r.ExpiresAt, &r.IsFeatured,
-		&r.DJDisplayName, &r.CreatorUserID,
+		&r.DJDisplayName, &r.CreatorUserID, &r.IsAutoplay,
 	)
 	return r, err
 }

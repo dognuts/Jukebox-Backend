@@ -3,6 +3,7 @@ package playback
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"sync"
 	"time"
@@ -95,7 +96,14 @@ func (s *SyncService) advanceTrack(roomID string) {
 		return
 	}
 
+	// If queue is empty, check if this is an autoplay room
 	if entry == nil {
+		room, _ := s.pg.GetRoomByID(ctx, roomID)
+		if room != nil && room.IsAutoplay {
+			s.advanceAutoplay(ctx, roomID, hub)
+			return
+		}
+
 		s.redis.ClearPlaybackState(ctx, roomID)
 		s.pg.ClearNowPlaying(ctx, roomID)
 		hub.Broadcast <- marshalMsg(ws.WSMessage{Event: ws.EventTrackChanged, Payload: nil})
@@ -125,6 +133,46 @@ func (s *SyncService) advanceTrack(roomID string) {
 	log.Printf("[playback] room %s now playing: %s - %s", roomID, entry.Track.Artist, entry.Track.Title)
 }
 
+// advanceAutoplay pulls the next track from the room's live autoplay playlist.
+func (s *SyncService) advanceAutoplay(ctx context.Context, roomID string, hub *ws.Hub) {
+	autoTrack, idx, err := s.pg.GetNextAutoplayTrack(ctx, roomID)
+	if err != nil || autoTrack == nil {
+		log.Printf("[autoplay] room %s: no autoplay tracks available", roomID)
+		s.redis.ClearPlaybackState(ctx, roomID)
+		s.pg.ClearNowPlaying(ctx, roomID)
+		hub.Broadcast <- marshalMsg(ws.WSMessage{Event: ws.EventTrackChanged, Payload: nil})
+		return
+	}
+
+	// Create a Track from the autoplay track
+	track := &models.Track{
+		ID:            fmt.Sprintf("auto-%s-%d-%d", roomID[:8], idx, time.Now().UnixMilli()),
+		Title:         autoTrack.Title,
+		Artist:        autoTrack.Artist,
+		Duration:      autoTrack.Duration,
+		Source:        models.TrackSource(autoTrack.Source),
+		SourceURL:     autoTrack.SourceURL,
+		AlbumGradient: autoTrack.AlbumGradient,
+		CreatedAt:     time.Now(),
+	}
+
+	ps := &models.PlaybackState{
+		RoomID:        roomID,
+		TrackID:       track.ID,
+		StartedAtUnix: time.Now().UnixMilli(),
+		IsPlaying:     true,
+		PausePosition: 0,
+	}
+	s.redis.SetPlaybackState(ctx, ps)
+
+	hub.Broadcast <- marshalMsg(ws.WSMessage{Event: ws.EventTrackChanged, Payload: track})
+	hub.Broadcast <- marshalMsg(ws.WSMessage{Event: ws.EventPlaybackState, Payload: ps})
+
+	s.ScheduleAdvance(roomID, track, ps.StartedAtUnix)
+
+	log.Printf("[autoplay] room %s now playing [%d]: %s - %s", roomID, idx, track.Artist, track.Title)
+}
+
 func (s *SyncService) Stop() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -132,6 +180,46 @@ func (s *SyncService) Stop() {
 		t.Stop()
 	}
 	s.timers = make(map[string]*time.Timer)
+}
+
+// StartAutoplayRooms boots all autoplay rooms on server start.
+func (s *SyncService) StartAutoplayRooms(ctx context.Context) {
+	rooms, err := s.pg.GetAutoplayRooms(ctx)
+	if err != nil {
+		log.Printf("[autoplay] failed to load autoplay rooms: %v", err)
+		return
+	}
+
+	for _, room := range rooms {
+		// Ensure room is marked live
+		s.pg.SetRoomAutoplay(ctx, room.ID, true)
+
+		// Ensure hub exists
+		hub := s.hubs.GetOrCreate(room.ID, room.Slug)
+		if hub == nil {
+			continue
+		}
+
+		// Check if already playing
+		ps, _ := s.redis.GetPlaybackState(ctx, room.ID)
+		if ps != nil && ps.IsPlaying && ps.TrackID != "" {
+			// Already playing — just re-schedule advance
+			track, _ := s.pg.GetTrack(ctx, ps.TrackID)
+			if track != nil {
+				s.ScheduleAdvance(room.ID, track, ps.StartedAtUnix)
+				log.Printf("[autoplay] resumed room %s (%s), currently playing: %s", room.Slug, room.ID, track.Title)
+				continue
+			}
+		}
+
+		// Start fresh — advance to first track
+		s.advanceAutoplay(ctx, room.ID, hub)
+		log.Printf("[autoplay] started room %s (%s)", room.Slug, room.ID)
+	}
+
+	if len(rooms) > 0 {
+		log.Printf("✓ Started %d autoplay room(s)", len(rooms))
+	}
 }
 
 func marshalMsg(msg ws.WSMessage) []byte {

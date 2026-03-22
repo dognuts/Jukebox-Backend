@@ -63,6 +63,7 @@ type Room struct {
 	IsFeatured     bool          `json:"isFeatured"`
 
 	CreatorUserID  string `json:"creatorUserId"`
+	IsAutoplay     bool   `json:"isAutoplay"`
 
 	// Populated at query time, not stored in rooms table
 	ListenerCount  int    `json:"listenerCount"`
@@ -441,4 +442,26 @@ type CreatorPoolAllocation struct {
 	ListenMinutes  int64  `json:"listenMinutes"`
 	SharePct       float64 `json:"sharePct"`
 	EarningsCents  int    `json:"earningsCents"`
+}
+
+// ---------- Autoplay ----------
+
+type AutoplayTrack struct {
+	Title         string `json:"title"`
+	Artist        string `json:"artist"`
+	Duration      int    `json:"duration"`
+	Source        string `json:"source"`
+	SourceURL     string `json:"sourceUrl"`
+	AlbumGradient string `json:"albumGradient,omitempty"`
+}
+
+type AutoplayPlaylist struct {
+	ID           string          `json:"id"`
+	RoomID       string          `json:"roomId"`
+	Status       string          `json:"status"` // "live" or "staged"
+	Name         string          `json:"name"`
+	Tracks       []AutoplayTrack `json:"tracks"`
+	CurrentIndex int             `json:"currentIndex"`
+	CreatedAt    time.Time       `json:"createdAt"`
+	ActivatedAt  *time.Time      `json:"activatedAt,omitempty"`
 }

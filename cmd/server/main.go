@@ -72,6 +72,9 @@ func main() {
 	idleMon.Start()
 	emailSvc := email.NewService(cfg.ResendAPIKey, cfg.FromEmail, cfg.FrontendURL)
 
+	// Boot autoplay rooms
+	syncSvc.StartAutoplayRooms(cleanupCtx)
+
 	// ---------- Handlers ----------
 
 	roomH := handlers.NewRoomHandler(pg, redis, hubMgr, syncSvc)
@@ -181,6 +184,14 @@ func main() {
 		r.Get("/admin/users/{id}", adminH.GetUser)
 		r.Patch("/admin/users/{id}", adminH.UpdateUser)
 		r.Delete("/admin/users/{id}", adminH.DeleteUser)
+
+		// Admin autoplay rooms
+		r.Post("/admin/autoplay/rooms", adminH.CreateAutoplayRoom)
+		r.Get("/admin/autoplay/rooms/{id}/playlists", adminH.GetAutoplayPlaylists)
+		r.Put("/admin/autoplay/rooms/{id}/staged", adminH.SaveStagedPlaylist)
+		r.Post("/admin/autoplay/rooms/{id}/activate", adminH.ActivatePlaylist)
+		r.Delete("/admin/autoplay/rooms/{id}/staged", adminH.DeleteStagedPlaylist)
+		r.Post("/admin/autoplay/rooms/{id}/stop", adminH.StopAutoplayRoom)
 
 		// Featured room (public)
 		r.Get("/featured", adminH.GetFeatured)
