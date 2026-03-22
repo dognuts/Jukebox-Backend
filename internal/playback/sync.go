@@ -97,11 +97,19 @@ func (s *SyncService) CancelAdvance(roomID string) {
 }
 
 func (s *SyncService) advanceTrack(roomID string) {
-	// Debounce: ignore if we advanced this room within the last 3 seconds
+	// Debounce: ignore if we advanced this room recently
 	s.mu.Lock()
-	if last, ok := s.lastAdvance[roomID]; ok && time.Since(last) < 3*time.Second {
-		s.mu.Unlock()
-		return
+	if last, ok := s.lastAdvance[roomID]; ok {
+		// For autoplay rooms, use a longer debounce to prevent rapid cycling
+		room, _ := s.pg.GetRoomByID(context.Background(), roomID)
+		minGap := 3 * time.Second
+		if room != nil && room.IsAutoplay {
+			minGap = 30 * time.Second
+		}
+		if time.Since(last) < minGap {
+			s.mu.Unlock()
+			return
+		}
 	}
 	s.lastAdvance[roomID] = time.Now()
 	// Cancel any pending timer for this room since we're advancing now
