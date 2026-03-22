@@ -104,7 +104,7 @@ func (s *SyncService) advanceTrack(roomID string) {
 		room, _ := s.pg.GetRoomByID(context.Background(), roomID)
 		minGap := 3 * time.Second
 		if room != nil && room.IsAutoplay {
-			minGap = 30 * time.Second
+			minGap = 10 * time.Second
 		}
 		if time.Since(last) < minGap {
 			s.mu.Unlock()

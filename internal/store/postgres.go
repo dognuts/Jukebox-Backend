@@ -35,14 +35,16 @@ func (s *PGStore) Close() {
 // Called on server startup to clean up stale state from a previous crash/restart.
 func (s *PGStore) ResetAllRoomsOffline(ctx context.Context) error {
 	now := time.Now()
+	// Don't reset autoplay rooms — they'll be re-booted by StartAutoplayRooms
 	_, err := s.pool.Exec(ctx,
-		`UPDATE rooms SET is_live = false, ended_at = $1, last_active_at = $1 WHERE is_live = true`,
+		`UPDATE rooms SET is_live = false, ended_at = $1, last_active_at = $1 WHERE is_live = true AND is_autoplay = false`,
 		now,
 	)
 	if err != nil {
 		return fmt.Errorf("reset rooms: %w", err)
 	}
-	_, err = s.pool.Exec(ctx, `DELETE FROM now_playing`)
+	// Only clear now_playing for non-autoplay rooms
+	_, err = s.pool.Exec(ctx, `DELETE FROM now_playing WHERE room_id NOT IN (SELECT id FROM rooms WHERE is_autoplay = true)`)
 	if err != nil {
 		return fmt.Errorf("clear now_playing: %w", err)
 	}
