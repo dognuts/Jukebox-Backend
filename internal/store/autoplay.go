@@ -163,7 +163,7 @@ func (s *PGStore) GetAutoplayRooms(ctx context.Context) ([]models.Room, error) {
 // SetRoomAutoplay sets the is_autoplay and is_live flags on a room.
 func (s *PGStore) SetRoomAutoplay(ctx context.Context, roomID string, autoplay bool) error {
 	_, err := s.pool.Exec(ctx,
-		`UPDATE rooms SET is_autoplay = $2, is_live = $2 WHERE id = $1`, roomID, autoplay)
+		`UPDATE rooms SET is_autoplay = $2, is_live = $2, ended_at = NULL, last_active_at = NOW() WHERE id = $1`, roomID, autoplay)
 	return err
 }
 
