@@ -302,10 +302,12 @@ type GoLiveRequest struct {
 // ---------- Auth Request/Response types ----------
 
 type SignupRequest struct {
-	Email       string `json:"email"`
-	Password    string `json:"password"`
-	DisplayName string `json:"displayName"`
-	StageName   string `json:"stageName"`
+	Email        string `json:"email"`
+	Password     string `json:"password"`
+	DisplayName  string `json:"displayName"`
+	StageName    string `json:"stageName"`
+	CaptchaToken string `json:"captchaToken"`
+	Website      string `json:"website"` // honeypot — must be empty
 }
 
 type LoginRequest struct {

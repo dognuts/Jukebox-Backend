@@ -15,6 +15,7 @@ import (
 	"github.com/jukebox/backend/internal/config"
 	"github.com/jukebox/backend/internal/email"
 	"github.com/jukebox/backend/internal/handlers"
+	"github.com/jukebox/backend/internal/antispam"
 	"github.com/jukebox/backend/internal/middleware"
 	"github.com/jukebox/backend/internal/playback"
 	"github.com/jukebox/backend/internal/store"
@@ -75,13 +76,17 @@ func main() {
 	// Boot autoplay rooms
 	syncSvc.StartAutoplayRooms(cleanupCtx)
 
+	// ---------- Anti-spam ----------
+
+	signupLimiter := antispam.NewRateLimiter(redis.Client(), 5) // max 5 signups per IP per hour
+
 	// ---------- Handlers ----------
 
 	roomH := handlers.NewRoomHandler(pg, redis, hubMgr, syncSvc)
 	queueH := handlers.NewQueueHandler(pg, redis, hubMgr)
 	sessionH := handlers.NewSessionHandler(redis)
 	wsH := handlers.NewWSHandler(pg, redis, hubMgr, cfg.JWTSecret)
-	authH := handlers.NewAuthHandler(pg, redis, emailSvc, cfg.JWTSecret)
+	authH := handlers.NewAuthHandler(pg, redis, emailSvc, cfg.JWTSecret, cfg.TurnstileSecretKey, signupLimiter)
 	msgH := handlers.NewMessageHandler(pg)
 	plH := handlers.NewPlaylistHandler(pg)
 	adminH := handlers.NewAdminHandler(pg, redis, hubMgr, syncSvc)

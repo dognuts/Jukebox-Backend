@@ -14,6 +14,7 @@ import (
 	"unicode"
 
 	"github.com/google/uuid"
+	"github.com/jukebox/backend/internal/antispam"
 	"github.com/jukebox/backend/internal/email"
 	"github.com/jukebox/backend/internal/middleware"
 	"github.com/jukebox/backend/internal/moderation"
@@ -23,14 +24,16 @@ import (
 )
 
 type AuthHandler struct {
-	pg        *store.PGStore
-	redis     *store.RedisStore
-	emailSvc  *email.Service
-	jwtSecret string
+	pg                 *store.PGStore
+	redis              *store.RedisStore
+	emailSvc           *email.Service
+	jwtSecret          string
+	turnstileSecret    string
+	signupRateLimiter  *antispam.RateLimiter
 }
 
-func NewAuthHandler(pg *store.PGStore, redis *store.RedisStore, emailSvc *email.Service, jwtSecret string) *AuthHandler {
-	return &AuthHandler{pg: pg, redis: redis, emailSvc: emailSvc, jwtSecret: jwtSecret}
+func NewAuthHandler(pg *store.PGStore, redis *store.RedisStore, emailSvc *email.Service, jwtSecret string, turnstileSecret string, rateLimiter *antispam.RateLimiter) *AuthHandler {
+	return &AuthHandler{pg: pg, redis: redis, emailSvc: emailSvc, jwtSecret: jwtSecret, turnstileSecret: turnstileSecret, signupRateLimiter: rateLimiter}
 }
 
 // POST /api/auth/signup
@@ -41,10 +44,58 @@ func (h *AuthHandler) Signup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// --- Anti-spam: honeypot ---
+	if req.Website != "" {
+		// Bots fill in the hidden honeypot field; real users never see it.
+		// Return a fake success so bots don't adapt.
+		log.Printf("[antispam] honeypot triggered from %s", r.RemoteAddr)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		w.Write([]byte(`{"status":"ok"}`))
+		return
+	}
+
+	// --- Anti-spam: rate limiting ---
+	ip := r.Header.Get("X-Forwarded-For")
+	if ip == "" {
+		ip = r.Header.Get("X-Real-IP")
+	}
+	if ip == "" {
+		ip = strings.Split(r.RemoteAddr, ":")[0]
+	}
+	if idx := strings.Index(ip, ","); idx != -1 {
+		ip = strings.TrimSpace(ip[:idx])
+	}
+	if h.signupRateLimiter != nil {
+		allowed, err := h.signupRateLimiter.AllowSignup(r.Context(), ip)
+		if err != nil {
+			log.Printf("[antispam] rate limit check error: %v", err)
+		}
+		if !allowed {
+			log.Printf("[antispam] rate limit exceeded for IP %s", ip)
+			http.Error(w, "too many signup attempts — please try again later", http.StatusTooManyRequests)
+			return
+		}
+	}
+
+	// --- Anti-spam: Turnstile CAPTCHA ---
+	if err := antispam.VerifyTurnstile(r.Context(), h.turnstileSecret, req.CaptchaToken, ip); err != nil {
+		log.Printf("[antispam] captcha failed from %s: %v", ip, err)
+		http.Error(w, "captcha verification failed — please try again", http.StatusBadRequest)
+		return
+	}
+
 	// Validate email
 	req.Email = strings.ToLower(strings.TrimSpace(req.Email))
 	if _, err := mail.ParseAddress(req.Email); err != nil {
 		http.Error(w, "invalid email address", http.StatusBadRequest)
+		return
+	}
+
+	// --- Anti-spam: disposable email (after normalization) ---
+	if antispam.IsDisposableEmail(req.Email) {
+		log.Printf("[antispam] disposable email blocked: %s", req.Email)
+		http.Error(w, "disposable email addresses are not allowed — please use a permanent email", http.StatusBadRequest)
 		return
 	}
 

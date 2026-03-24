@@ -27,6 +27,7 @@ type Config struct {
 	LiveKitURL       string
 	LiveKitAPIKey    string
 	LiveKitAPISecret string
+	TurnstileSecretKey string
 }
 
 func Load() *Config {
@@ -57,6 +58,7 @@ func Load() *Config {
 		LiveKitURL:       getEnv("LIVEKIT_URL", ""),
 		LiveKitAPIKey:    getEnv("LIVEKIT_API_KEY", ""),
 		LiveKitAPISecret: getEnv("LIVEKIT_API_SECRET", ""),
+		TurnstileSecretKey: getEnv("TURNSTILE_SECRET_KEY", ""),
 	}
 }
 
