@@ -25,6 +25,12 @@ import (
 func main() {
 	cfg := config.Load()
 
+	// ---------- Error monitoring ----------
+	if err := middleware.InitSentry(cfg.SentryDSN, cfg.Env); err != nil {
+		log.Printf("sentry warning: %v", err)
+	}
+	defer middleware.FlushSentry()
+
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -102,6 +108,8 @@ func main() {
 	r.Use(chimw.Recoverer)
 	r.Use(chimw.RequestID)
 	r.Use(chimw.RealIP)
+	r.Use(middleware.SentryRecover) // capture panics to Sentry
+	r.Use(middleware.SentryMiddleware()) // transaction tracking
 
 	// Security headers
 	r.Use(middleware.SecurityHeaders(cfg.CORSOrigins))

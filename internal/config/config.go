@@ -28,6 +28,7 @@ type Config struct {
 	LiveKitAPIKey    string
 	LiveKitAPISecret string
 	TurnstileSecretKey string
+	SentryDSN          string
 }
 
 func Load() *Config {
@@ -59,6 +60,7 @@ func Load() *Config {
 		LiveKitAPIKey:    getEnv("LIVEKIT_API_KEY", ""),
 		LiveKitAPISecret: getEnv("LIVEKIT_API_SECRET", ""),
 		TurnstileSecretKey: getEnv("TURNSTILE_SECRET_KEY", ""),
+		SentryDSN:          getEnv("SENTRY_DSN", ""),
 	}
 }
 
