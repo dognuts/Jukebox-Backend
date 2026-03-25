@@ -200,6 +200,9 @@ func main() {
 
 		// Admin autoplay rooms
 		r.Post("/admin/autoplay/rooms", adminH.CreateAutoplayRoom)
+
+		// Admin metrics
+		r.Get("/admin/metrics", adminH.GetMetrics)
 		r.Get("/admin/autoplay/rooms/{id}/playlists", adminH.GetAutoplayPlaylists)
 		r.Put("/admin/autoplay/rooms/{id}/staged", adminH.SaveStagedPlaylist)
 		r.Post("/admin/autoplay/rooms/{id}/activate", adminH.ActivatePlaylist)

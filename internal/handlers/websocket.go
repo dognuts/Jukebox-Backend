@@ -33,6 +33,7 @@ func (h *WSHandler) HandleRoomWS(w http.ResponseWriter, r *http.Request) {
 	upgrader := websocket.Upgrader{
 		ReadBufferSize:  1024,
 		WriteBufferSize: 1024,
+		EnableCompression: true, // permessage-deflate — reduces bandwidth ~60-70%
 		CheckOrigin: func(r *http.Request) bool {
 			origin := r.Header.Get("Origin")
 			if origin == "" {
@@ -68,6 +69,8 @@ func (h *WSHandler) HandleRoomWS(w http.ResponseWriter, r *http.Request) {
 		log.Printf("ws upgrade: %v", err)
 		return
 	}
+	conn.EnableWriteCompression(true)
+	conn.SetCompressionLevel(6) // balanced speed vs size
 
 	// Get or create hub for this room
 	hub := h.hubs.GetOrCreate(room.ID, room.Slug)

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -526,4 +527,37 @@ func (h *AdminHandler) StopAutoplayRoom(w http.ResponseWriter, r *http.Request) 
 	h.pg.ClearNowPlaying(ctx, roomID)
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "stopped"})
+}
+
+// GET /api/admin/metrics — dashboard metrics
+func (h *AdminHandler) GetMetrics(w http.ResponseWriter, r *http.Request) {
+	if h.requireAdmin(r) == nil {
+		http.Error(w, "admin required", http.StatusForbidden)
+		return
+	}
+	ctx := r.Context()
+
+	daysParam := r.URL.Query().Get("days")
+	days := 30
+	if daysParam != "" {
+		if d, err := strconv.Atoi(daysParam); err == nil && d > 0 && d <= 90 {
+			days = d
+		}
+	}
+
+	summary, _ := h.pg.GetMetricsSummary(ctx)
+	signups, _ := h.pg.GetSignupsPerDay(ctx, days)
+	roomsCreated, _ := h.pg.GetRoomsCreatedPerDay(ctx, days)
+	activeRooms, _ := h.pg.GetActiveRoomsPerDay(ctx, days)
+	topGenres, _ := h.pg.GetTopGenres(ctx, 10)
+	listenHours, _ := h.pg.GetListenHoursPerDay(ctx, days)
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"summary":      summary,
+		"signups":      signups,
+		"roomsCreated": roomsCreated,
+		"activeRooms":  activeRooms,
+		"topGenres":    topGenres,
+		"listenHours":  listenHours,
+	})
 }

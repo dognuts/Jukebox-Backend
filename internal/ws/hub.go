@@ -23,6 +23,7 @@ type Hub struct {
 	Inbound    chan *ClientMessage
 	Broadcast  chan []byte
 	mu         sync.RWMutex
+	listenerListTimer *time.Timer
 
 	pg    *store.PGStore
 	redis *store.RedisStore
@@ -31,6 +32,8 @@ type Hub struct {
 	OnAutoplayEnd func(roomID string)
 	// OnReportDuration is called when a client reports actual track duration
 	OnReportDuration func(roomID string, trackID string, duration int)
+	// OnShutdown is called when the hub stops (no clients, room offline)
+	OnShutdown func(roomID string)
 }
 
 // NewHub creates a hub for the given room.
@@ -89,6 +92,7 @@ func (h *Hub) Run() {
 				delete(h.Clients, client)
 				close(client.Send)
 			}
+			clientCount := len(h.Clients)
 			h.mu.Unlock()
 
 			ctx := context.Background()
@@ -105,6 +109,18 @@ func (h *Hub) Run() {
 			if client.UserID != "" {
 				evtID := client.Session.ID + ":" + h.RoomID
 				h.pg.EndListenEvent(ctx, evtID, 0)
+			}
+
+			// If no clients remain and room is no longer live, clean up this hub
+			if clientCount == 0 {
+				room, _ := h.pg.GetRoomByID(ctx, h.RoomID)
+				if room == nil || !room.IsLive {
+					log.Printf("[ws] hub %s has no clients and room is offline, shutting down", h.RoomSlug)
+					if h.OnShutdown != nil {
+						h.OnShutdown(h.RoomID)
+					}
+					return // exits the Run() goroutine
+				}
 			}
 
 		case msg := <-h.Inbound:
@@ -215,6 +231,13 @@ func (h *Hub) handleInbound(cm *ClientMessage) {
 			client.sendError("message too long (max 500 chars)")
 			return
 		}
+		// Rate limit: max 1 message per 500ms per client
+		now := time.Now()
+		if now.Sub(client.LastChat) < 500*time.Millisecond {
+			client.sendError("slow down — you're sending messages too fast")
+			return
+		}
+		client.LastChat = now
 
 		chatMsg := &models.ChatMessage{
 			ID:          uuid.New().String(),
@@ -542,7 +565,9 @@ func (h *Hub) handleInbound(cm *ClientMessage) {
 		}
 
 	case ActionAutoplayEnd:
-		// Any listener can report that the autoplay track ended
+		// Any listener can report that the autoplay track ended.
+		// The advanceTrack debounce prevents double-advances, but we avoid
+		// spawning a goroutine for every listener's report in a burst.
 		if h.OnAutoplayEnd != nil {
 			go h.OnAutoplayEnd(h.RoomID)
 		}
@@ -607,8 +632,17 @@ func (h *Hub) broadcastListenerCount(count int) {
 		Event:   EventListenerCount,
 		Payload: map[string]int{"count": count},
 	})
-	// Also broadcast the listener list
-	h.broadcastListenerList()
+	// Throttle listener list broadcasts — schedule one 500ms from now,
+	// cancelling any pending one. This collapses burst join/leave events
+	// into a single list broadcast.
+	h.mu.Lock()
+	if h.listenerListTimer != nil {
+		h.listenerListTimer.Stop()
+	}
+	h.listenerListTimer = time.AfterFunc(500*time.Millisecond, func() {
+		h.broadcastListenerList()
+	})
+	h.mu.Unlock()
 }
 
 func (h *Hub) broadcastListenerList() {
@@ -690,6 +724,9 @@ func (m *HubManager) GetOrCreate(roomID, roomSlug string) *Hub {
 	hub := NewHub(roomID, roomSlug, m.pg, m.redis)
 	hub.OnAutoplayEnd = m.OnAutoplayEnd
 	hub.OnReportDuration = m.OnReportDuration
+	hub.OnShutdown = func(roomID string) {
+		m.Remove(roomID)
+	}
 	m.hubs[roomID] = hub
 	go hub.Run()
 	return hub

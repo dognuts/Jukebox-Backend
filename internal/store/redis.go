@@ -101,20 +101,11 @@ func (r *RedisStore) GetSession(ctx context.Context, id string) (*models.Session
 }
 
 func (r *RedisStore) UpdateSessionName(ctx context.Context, id, displayName string) error {
-	s, err := r.GetSession(ctx, id)
-	if err != nil || s == nil {
-		return fmt.Errorf("session not found")
-	}
-	s.DisplayName = displayName
-	data, err := json.Marshal(s)
-	if err != nil {
-		return err
-	}
-	ttl := time.Until(s.ExpiresAt)
-	if ttl <= 0 {
-		ttl = r.sessionTTL
-	}
-	return r.client.Set(ctx, "session:"+id, data, ttl).Err()
+	key := "session:" + id
+	// Use a transaction to prevent race conditions with UpdateSessionUser
+	return r.updateSessionField(ctx, key, func(s *models.Session) {
+		s.DisplayName = displayName
+	})
 }
 
 func (r *RedisStore) RefreshSession(ctx context.Context, id string) error {
@@ -123,20 +114,54 @@ func (r *RedisStore) RefreshSession(ctx context.Context, id string) error {
 
 // UpdateSessionUser links an anonymous session to a registered user.
 func (r *RedisStore) UpdateSessionUser(ctx context.Context, sessionID, userID string) error {
-	s, err := r.GetSession(ctx, sessionID)
-	if err != nil || s == nil {
-		return fmt.Errorf("session not found")
-	}
-	s.UserID = userID
-	data, err := json.Marshal(s)
-	if err != nil {
+	key := "session:" + sessionID
+	return r.updateSessionField(ctx, key, func(s *models.Session) {
+		s.UserID = userID
+	})
+}
+
+// updateSessionField atomically updates a session using Redis WATCH/MULTI/EXEC.
+func (r *RedisStore) updateSessionField(ctx context.Context, key string, mutate func(*models.Session)) error {
+	// Retry up to 3 times on WATCH conflicts
+	for i := 0; i < 3; i++ {
+		err := r.client.Watch(ctx, func(tx *redis.Tx) error {
+			data, err := tx.Get(ctx, key).Bytes()
+			if err != nil {
+				return fmt.Errorf("session not found")
+			}
+			var s models.Session
+			if err := json.Unmarshal(data, &s); err != nil {
+				return err
+			}
+
+			mutate(&s)
+
+			newData, err := json.Marshal(s)
+			if err != nil {
+				return err
+			}
+
+			ttl := time.Until(s.ExpiresAt)
+			if ttl <= 0 {
+				ttl = r.sessionTTL
+			}
+
+			_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+				pipe.Set(ctx, key, newData, ttl)
+				return nil
+			})
+			return err
+		}, key)
+
+		if err == nil {
+			return nil
+		}
+		if err == redis.TxFailedErr {
+			continue // retry on WATCH conflict
+		}
 		return err
 	}
-	ttl := time.Until(s.ExpiresAt)
-	if ttl <= 0 {
-		ttl = r.sessionTTL
-	}
-	return r.client.Set(ctx, "session:"+sessionID, data, ttl).Err()
+	return fmt.Errorf("session update failed after retries")
 }
 
 // ==================== Playback State ====================

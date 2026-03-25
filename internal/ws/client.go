@@ -18,13 +18,14 @@ const (
 
 // Client represents a single WebSocket connection to a room.
 type Client struct {
-	Hub     *Hub
-	Conn    *websocket.Conn
-	Send    chan []byte
-	Session *models.Session
-	UserID  string       // set if authenticated user
-	User    *models.User // full user record if authenticated
-	IsDJ    bool
+	Hub      *Hub
+	Conn     *websocket.Conn
+	Send     chan []byte
+	Session  *models.Session
+	UserID   string       // set if authenticated user
+	User     *models.User // full user record if authenticated
+	IsDJ     bool
+	LastChat time.Time    // rate limit chat messages
 }
 
 // DisplayName returns the best display name: stage name > display name > session name.

@@ -136,32 +136,51 @@ func (h *RoomHandler) Create(w http.ResponseWriter, r *http.Request) {
 
 	// Pre-load queue from a user tracklist if provided
 	if req.PlaylistID != "" && user != nil {
+		log.Printf("[room] attempting to pre-load playlist %s for room %s", req.PlaylistID, room.Slug)
 		pl, err := h.pg.GetPlaylistWithTracks(r.Context(), req.PlaylistID)
-		if err == nil && pl != nil && pl.UserID == user.ID && len(pl.Tracks) > 0 {
+		if err != nil {
+			log.Printf("[room] failed to fetch playlist %s: %v", req.PlaylistID, err)
+		} else if pl == nil {
+			log.Printf("[room] playlist %s not found", req.PlaylistID)
+		} else if pl.UserID != user.ID {
+			log.Printf("[room] playlist %s belongs to %s, not %s", req.PlaylistID, pl.UserID, user.ID)
+		} else if len(pl.Tracks) == 0 {
+			log.Printf("[room] playlist %s has no tracks", req.PlaylistID)
+		} else {
+			loaded := 0
 			for i, pt := range pl.Tracks {
+				// Ensure the track exists in the tracks table (it should, but be safe)
+				track := &models.Track{
+					ID:            pt.TrackID,
+					Title:         pt.Title,
+					Artist:        pt.Artist,
+					Duration:      pt.Duration,
+					Source:        models.TrackSource(pt.Source),
+					SourceURL:     pt.SourceUrl,
+					AlbumGradient: pt.AlbumGradient,
+					CreatedAt:     time.Now(),
+				}
+				if err := h.pg.UpsertTrack(r.Context(), track); err != nil {
+					log.Printf("[room] pre-load: failed to upsert track %d (%s): %v", i, pt.TrackID, err)
+					continue
+				}
+
 				entry := &models.QueueEntry{
-					ID:     uuid.New().String(),
-					RoomID: room.ID,
-					Track: models.Track{
-						ID:            pt.TrackID,
-						Title:         pt.Title,
-						Artist:        pt.Artist,
-						Duration:      pt.Duration,
-						Source:        models.TrackSource(pt.Source),
-						SourceURL:     pt.SourceUrl,
-						AlbumGradient: pt.AlbumGradient,
-					},
+					ID:          uuid.New().String(),
+					RoomID:      room.ID,
+					Track:       *track,
 					SubmittedBy: djName,
 					SessionID:   session.ID,
 					Status:      models.QueueApproved,
 					CreatedAt:   time.Now(),
 				}
-				_ = i
 				if err := h.pg.AddToQueue(r.Context(), entry); err != nil {
-					log.Printf("pre-load track %d from playlist: %v", i, err)
+					log.Printf("[room] pre-load: failed to queue track %d (%s - %s): %v", i, pt.Artist, pt.Title, err)
+					continue
 				}
+				loaded++
 			}
-			log.Printf("[room] pre-loaded %d tracks from playlist %s into %s", len(pl.Tracks), pl.Name, room.Slug)
+			log.Printf("[room] pre-loaded %d/%d tracks from playlist '%s' into room %s", loaded, len(pl.Tracks), pl.Name, room.Slug)
 		}
 	}
 
