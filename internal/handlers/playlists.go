@@ -21,10 +21,28 @@ func NewPlaylistHandler(pg *store.PGStore) *PlaylistHandler {
 }
 
 // GET /api/playlists — list user's playlists
+// ?include=tracks to also return track data for each playlist
 func (h *PlaylistHandler) List(w http.ResponseWriter, r *http.Request) {
 	user := middleware.GetUser(r.Context())
 	if user == nil {
 		http.Error(w, "authentication required", http.StatusUnauthorized)
+		return
+	}
+
+	// Ensure liked playlist exists
+	h.pg.EnsureLikedPlaylist(r.Context(), user.ID)
+
+	include := r.URL.Query().Get("include")
+	if include == "tracks" {
+		playlists, err := h.pg.GetPlaylistsWithTracksByUser(r.Context(), user.ID)
+		if err != nil {
+			http.Error(w, "failed to list playlists", http.StatusInternalServerError)
+			return
+		}
+		if playlists == nil {
+			playlists = []models.Playlist{}
+		}
+		writeJSON(w, http.StatusOK, playlists)
 		return
 	}
 

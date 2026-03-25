@@ -85,7 +85,7 @@ func main() {
 	roomH := handlers.NewRoomHandler(pg, redis, hubMgr, syncSvc)
 	queueH := handlers.NewQueueHandler(pg, redis, hubMgr)
 	sessionH := handlers.NewSessionHandler(redis)
-	wsH := handlers.NewWSHandler(pg, redis, hubMgr, cfg.JWTSecret)
+	wsH := handlers.NewWSHandler(pg, redis, hubMgr, cfg.JWTSecret, cfg.CORSOrigins)
 	authH := handlers.NewAuthHandler(pg, redis, emailSvc, cfg.JWTSecret, cfg.TurnstileSecretKey, signupLimiter)
 	msgH := handlers.NewMessageHandler(pg)
 	plH := handlers.NewPlaylistHandler(pg)
@@ -102,6 +102,13 @@ func main() {
 	r.Use(chimw.Recoverer)
 	r.Use(chimw.RequestID)
 	r.Use(chimw.RealIP)
+
+	// Security headers
+	r.Use(middleware.SecurityHeaders(cfg.CORSOrigins))
+
+	// Limit request body size to 10MB (covers cover art uploads)
+	r.Use(middleware.MaxBodySize(10 * 1024 * 1024))
+
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins:   cfg.CORSOrigins,
 		AllowedMethods:   []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},

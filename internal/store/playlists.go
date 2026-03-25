@@ -34,11 +34,9 @@ func (s *PGStore) GetPlaylistsByUser(ctx context.Context, userID string) ([]mode
 	var playlists []models.Playlist
 	for rows.Next() {
 		var p models.Playlist
-		var trackCount int
-		if err := rows.Scan(&p.ID, &p.UserID, &p.Name, &p.IsLiked, &p.CreatedAt, &p.UpdatedAt, &trackCount); err != nil {
+		if err := rows.Scan(&p.ID, &p.UserID, &p.Name, &p.IsLiked, &p.CreatedAt, &p.UpdatedAt, &p.TrackCount); err != nil {
 			return nil, err
 		}
-		_ = trackCount // available for response if needed
 		playlists = append(playlists, p)
 	}
 	return playlists, nil
@@ -63,7 +61,8 @@ func (s *PGStore) GetPlaylistWithTracks(ctx context.Context, playlistID string) 
 	}
 
 	rows, err := s.pool.Query(ctx, `
-		SELECT pt.id, pt.track_id, pt.position, pt.added_at, t.title, t.artist, t.duration
+		SELECT pt.id, pt.track_id, pt.position, pt.added_at,
+			t.title, t.artist, t.duration, t.source, t.source_url, t.album_gradient
 		FROM playlist_tracks pt
 		JOIN tracks t ON t.id = pt.track_id
 		WHERE pt.playlist_id = $1
@@ -75,11 +74,13 @@ func (s *PGStore) GetPlaylistWithTracks(ctx context.Context, playlistID string) 
 
 	for rows.Next() {
 		var t models.PlaylistTrack
-		if err := rows.Scan(&t.ID, &t.TrackID, &t.Position, &t.AddedAt, &t.Title, &t.Artist, &t.Duration); err != nil {
+		if err := rows.Scan(&t.ID, &t.TrackID, &t.Position, &t.AddedAt,
+			&t.Title, &t.Artist, &t.Duration, &t.Source, &t.SourceUrl, &t.AlbumGradient); err != nil {
 			return p, err
 		}
 		p.Tracks = append(p.Tracks, t)
 	}
+	p.TrackCount = len(p.Tracks)
 	return p, nil
 }
 
@@ -116,6 +117,53 @@ func (s *PGStore) RemoveTrackFromPlaylist(ctx context.Context, playlistID, track
 		s.pool.Exec(ctx, `UPDATE playlists SET updated_at = NOW() WHERE id = $1`, playlistID)
 	}
 	return err
+}
+
+// GetPlaylistsWithTracksByUser returns all playlists for a user, each with their full track list.
+func (s *PGStore) GetPlaylistsWithTracksByUser(ctx context.Context, userID string) ([]models.Playlist, error) {
+	playlists, err := s.GetPlaylistsByUser(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	if len(playlists) == 0 {
+		return playlists, nil
+	}
+
+	// Collect all playlist IDs
+	ids := make([]string, len(playlists))
+	byID := make(map[string]int, len(playlists))
+	for i, p := range playlists {
+		ids[i] = p.ID
+		byID[p.ID] = i
+	}
+
+	// Fetch all tracks in one query
+	rows, err := s.pool.Query(ctx, `
+		SELECT pt.playlist_id, pt.id, pt.track_id, pt.position, pt.added_at,
+			t.title, t.artist, t.duration, t.source, t.source_url, t.album_gradient
+		FROM playlist_tracks pt
+		JOIN tracks t ON t.id = pt.track_id
+		WHERE pt.playlist_id = ANY($1)
+		ORDER BY pt.playlist_id, pt.position ASC`, ids)
+	if err != nil {
+		return playlists, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var playlistID string
+		var t models.PlaylistTrack
+		if err := rows.Scan(&playlistID, &t.ID, &t.TrackID, &t.Position, &t.AddedAt,
+			&t.Title, &t.Artist, &t.Duration, &t.Source, &t.SourceUrl, &t.AlbumGradient); err != nil {
+			return playlists, err
+		}
+		if idx, ok := byID[playlistID]; ok {
+			playlists[idx].Tracks = append(playlists[idx].Tracks, t)
+			playlists[idx].TrackCount = len(playlists[idx].Tracks)
+		}
+	}
+
+	return playlists, nil
 }
 
 // EnsureLikedPlaylist creates the "Liked Tracks" playlist if it doesn't exist.

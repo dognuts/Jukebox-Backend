@@ -276,6 +276,29 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// --- Anti-spam: rate limit login attempts ---
+	ip := r.Header.Get("X-Forwarded-For")
+	if ip == "" {
+		ip = r.Header.Get("X-Real-IP")
+	}
+	if ip == "" {
+		ip = strings.Split(r.RemoteAddr, ":")[0]
+	}
+	if idx := strings.Index(ip, ","); idx != -1 {
+		ip = strings.TrimSpace(ip[:idx])
+	}
+	if h.signupRateLimiter != nil {
+		allowed, err := h.signupRateLimiter.AllowLogin(r.Context(), ip)
+		if err != nil {
+			log.Printf("[antispam] login rate limit check error: %v", err)
+		}
+		if !allowed {
+			log.Printf("[antispam] login rate limit exceeded for IP %s", ip)
+			http.Error(w, "too many login attempts — please try again later", http.StatusTooManyRequests)
+			return
+		}
+	}
+
 	req.Email = strings.ToLower(strings.TrimSpace(req.Email))
 	ctx := r.Context()
 

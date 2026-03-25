@@ -11,28 +11,40 @@ import (
 	"github.com/jukebox/backend/internal/ws"
 )
 
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
-	CheckOrigin: func(r *http.Request) bool {
-		// In production, validate against allowed origins
-		return true
-	},
-}
-
 type WSHandler struct {
 	pg        *store.PGStore
 	redis     *store.RedisStore
 	hubs      *ws.HubManager
 	jwtSecret string
+	allowedOrigins map[string]bool
 }
 
-func NewWSHandler(pg *store.PGStore, redis *store.RedisStore, hubs *ws.HubManager, jwtSecret string) *WSHandler {
-	return &WSHandler{pg: pg, redis: redis, hubs: hubs, jwtSecret: jwtSecret}
+func NewWSHandler(pg *store.PGStore, redis *store.RedisStore, hubs *ws.HubManager, jwtSecret string, corsOrigins []string) *WSHandler {
+	origins := make(map[string]bool, len(corsOrigins))
+	for _, o := range corsOrigins {
+		origins[o] = true
+	}
+	return &WSHandler{pg: pg, redis: redis, hubs: hubs, jwtSecret: jwtSecret, allowedOrigins: origins}
 }
 
 // GET /ws/room/{slug}?djKey=optional
 func (h *WSHandler) HandleRoomWS(w http.ResponseWriter, r *http.Request) {
+	// Validate WebSocket origin
+	upgrader := websocket.Upgrader{
+		ReadBufferSize:  1024,
+		WriteBufferSize: 1024,
+		CheckOrigin: func(r *http.Request) bool {
+			origin := r.Header.Get("Origin")
+			if origin == "" {
+				return true // non-browser clients (curl, etc.)
+			}
+			// Allow in development
+			if h.allowedOrigins["http://localhost:3000"] && (origin == "http://localhost:3000" || origin == "http://localhost:8080") {
+				return true
+			}
+			return h.allowedOrigins[origin]
+		},
+	}
 	slug := chi.URLParam(r, "slug")
 	ctx := r.Context()
 

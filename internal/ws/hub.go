@@ -150,15 +150,17 @@ func (h *Hub) sendInitialState(client *Client) {
 	// Playback state
 	ps, _ := h.redis.GetPlaybackState(ctx, h.RoomID)
 	if ps != nil {
-		client.SendJSON(WSMessage{Event: EventPlaybackState, Payload: ps})
-
-		// Send current track info
+		// Send current track info FIRST so the client can start loading the player
+		// before the playback state tells it where to seek
 		if ps.TrackID != "" {
 			track, _ := h.pg.GetTrack(ctx, ps.TrackID)
 			if track != nil {
 				client.SendJSON(WSMessage{Event: EventTrackChanged, Payload: track})
 			}
 		}
+
+		// Now send playback state — client already has the track loaded
+		client.SendJSON(WSMessage{Event: EventPlaybackState, Payload: ps})
 	}
 
 	// Current queue

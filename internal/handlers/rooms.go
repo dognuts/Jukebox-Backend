@@ -134,6 +134,37 @@ func (h *RoomHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Pre-load queue from a user tracklist if provided
+	if req.PlaylistID != "" && user != nil {
+		pl, err := h.pg.GetPlaylistWithTracks(r.Context(), req.PlaylistID)
+		if err == nil && pl != nil && pl.UserID == user.ID && len(pl.Tracks) > 0 {
+			for i, pt := range pl.Tracks {
+				entry := &models.QueueEntry{
+					ID:     uuid.New().String(),
+					RoomID: room.ID,
+					Track: models.Track{
+						ID:            pt.TrackID,
+						Title:         pt.Title,
+						Artist:        pt.Artist,
+						Duration:      pt.Duration,
+						Source:        models.TrackSource(pt.Source),
+						SourceURL:     pt.SourceUrl,
+						AlbumGradient: pt.AlbumGradient,
+					},
+					SubmittedBy: djName,
+					SessionID:   session.ID,
+					Status:      models.QueueApproved,
+					CreatedAt:   time.Now(),
+				}
+				_ = i
+				if err := h.pg.AddToQueue(r.Context(), entry); err != nil {
+					log.Printf("pre-load track %d from playlist: %v", i, err)
+				}
+			}
+			log.Printf("[room] pre-loaded %d tracks from playlist %s into %s", len(pl.Tracks), pl.Name, room.Slug)
+		}
+	}
+
 	writeJSON(w, http.StatusCreated, models.CreateRoomResponse{
 		Room:  *room,
 		DJKey: djKey,

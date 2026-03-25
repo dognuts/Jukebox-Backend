@@ -223,24 +223,28 @@ type FavoriteRoom struct {
 // ---------- Playlists ----------
 
 type Playlist struct {
-	ID        string          `json:"id"`
-	UserID    string          `json:"userId"`
-	Name      string          `json:"name"`
-	IsLiked   bool            `json:"isLiked"`
-	Tracks    []PlaylistTrack `json:"tracks,omitempty"`
-	CreatedAt time.Time       `json:"createdAt"`
-	UpdatedAt time.Time       `json:"updatedAt"`
+	ID         string          `json:"id"`
+	UserID     string          `json:"userId"`
+	Name       string          `json:"name"`
+	IsLiked    bool            `json:"isLiked"`
+	TrackCount int             `json:"trackCount"`
+	Tracks     []PlaylistTrack `json:"tracks,omitempty"`
+	CreatedAt  time.Time       `json:"createdAt"`
+	UpdatedAt  time.Time       `json:"updatedAt"`
 }
 
 type PlaylistTrack struct {
-	ID       string `json:"id"`
-	TrackID  string `json:"trackId"`
-	Position int    `json:"position"`
-	AddedAt  string `json:"addedAt"`
+	ID            string `json:"id"`
+	TrackID       string `json:"trackId"`
+	Position      int    `json:"position"`
+	AddedAt       string `json:"addedAt"`
 	// Joined from tracks table
-	Title    string `json:"title,omitempty"`
-	Artist   string `json:"artist,omitempty"`
-	Duration int    `json:"duration,omitempty"`
+	Title         string `json:"title,omitempty"`
+	Artist        string `json:"artist,omitempty"`
+	Duration      int    `json:"duration,omitempty"`
+	Source        string `json:"source,omitempty"`
+	SourceUrl     string `json:"sourceUrl,omitempty"`
+	AlbumGradient string `json:"albumGradient,omitempty"`
 }
 
 // ---------- Playback State (lives in Redis) ----------
@@ -264,6 +268,7 @@ type CreateRoomRequest struct {
 	ScheduledStart string   `json:"scheduledStart,omitempty"` // ISO 8601
 	CoverArt       string   `json:"coverArt,omitempty"`       // data URL or external URL
 	CoverGradient  string   `json:"coverGradient,omitempty"`
+	PlaylistID     string   `json:"playlistId,omitempty"`     // pre-load queue from a user tracklist
 }
 
 type CreateRoomResponse struct {
