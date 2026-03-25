@@ -188,6 +188,46 @@ func (h *AdminHandler) ShutdownRoom(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "shutdown"})
 }
 
+// DELETE /api/admin/rooms/{id} — permanently delete a room
+func (h *AdminHandler) DeleteRoom(w http.ResponseWriter, r *http.Request) {
+	if h.requireAdmin(r) == nil {
+		http.Error(w, "admin required", http.StatusForbidden)
+		return
+	}
+	roomID := chi.URLParam(r, "id")
+	ctx := r.Context()
+
+	room, err := h.pg.GetRoomByID(ctx, roomID)
+	if err != nil || room == nil {
+		http.Error(w, "room not found", http.StatusNotFound)
+		return
+	}
+
+	// If room is live, shut it down first
+	if room.IsLive {
+		h.pg.ClearNowPlaying(ctx, room.ID)
+		h.redis.ClearPlaybackState(ctx, room.ID)
+		h.redis.ClearListeners(ctx, room.ID)
+		h.playback.CancelAdvance(room.ID)
+
+		if hub := h.hubs.Get(room.ID); hub != nil {
+			hub.BroadcastJSON(ws.WSMessage{
+				Event:   "room_ended",
+				Payload: map[string]string{"reason": "Room was deleted by an administrator"},
+			})
+		}
+	}
+
+	if err := h.pg.DeleteRoom(ctx, room.ID); err != nil {
+		log.Printf("[admin] delete room %s: %v", room.ID, err)
+		http.Error(w, "failed to delete room", http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("[admin] deleted room %s (%s)", room.Name, room.ID)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
 // POST /api/admin/rooms/{id}/feature — set room as featured
 func (h *AdminHandler) SetFeatured(w http.ResponseWriter, r *http.Request) {
 	if h.requireAdmin(r) == nil {

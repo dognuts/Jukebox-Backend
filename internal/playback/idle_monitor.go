@@ -66,6 +66,18 @@ func (m *IdleMonitor) loop() {
 func (m *IdleMonitor) check() {
 	ctx := context.Background()
 
+	// ── Ghost room cleanup ──
+	// Delete rooms that were created but never went live and are older than 1 hour.
+	// This catches rooms where the DJ never connected via WebSocket at all
+	// (e.g., created via API but never visited the room page).
+	cleaned, err := m.pg.CleanupGhostRooms(ctx, 1*time.Hour)
+	if err != nil {
+		log.Printf("[idle-monitor] ghost cleanup error: %v", err)
+	} else if cleaned > 0 {
+		log.Printf("[idle-monitor] cleaned up %d ghost room(s) (created >1h ago, never went live)", cleaned)
+	}
+
+	// ── Idle live room check ──
 	// Get all live rooms
 	rooms, err := m.pg.ListRooms(ctx, true, "")
 	if err != nil {

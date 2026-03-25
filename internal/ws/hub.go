@@ -111,6 +111,32 @@ func (h *Hub) Run() {
 				h.pg.EndListenEvent(ctx, evtID, 0)
 			}
 
+			// If the DJ disconnects from a room that was NEVER live, auto-delete it.
+			// This prevents ghost rooms from piling up when DJs create rooms
+			// but leave before going live.
+			if client.IsDJ {
+				wasEverLive, err := h.pg.WasRoomEverLive(ctx, h.RoomID)
+				if err == nil && !wasEverLive {
+					log.Printf("[ws] DJ left room %s before going live — auto-deleting", h.RoomSlug)
+
+					// Notify any remaining listeners
+					h.broadcastJSON(WSMessage{
+						Event:   "room_ended",
+						Payload: map[string]string{"reason": "The DJ left before going live"},
+					})
+
+					// Clean up
+					h.pg.DeleteRoom(ctx, h.RoomID)
+					h.redis.ClearPlaybackState(ctx, h.RoomID)
+					h.redis.ClearListeners(ctx, h.RoomID)
+
+					if h.OnShutdown != nil {
+						h.OnShutdown(h.RoomID)
+					}
+					return // shut down this hub
+				}
+			}
+
 			// If no clients remain and room is no longer live, clean up this hub
 			if clientCount == 0 {
 				room, _ := h.pg.GetRoomByID(ctx, h.RoomID)

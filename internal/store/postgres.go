@@ -191,6 +191,46 @@ func (s *PGStore) EndRoom(ctx context.Context, roomID string) error {
 	return err
 }
 
+// DeleteRoom permanently removes a room and its associated data (queue, chat, etc.).
+// Use for rooms that were created but never went live.
+func (s *PGStore) DeleteRoom(ctx context.Context, roomID string) error {
+	// CASCADE on foreign keys handles queue_entries, chat_messages, now_playing, etc.
+	_, err := s.pool.Exec(ctx, `DELETE FROM rooms WHERE id = $1`, roomID)
+	return err
+}
+
+// WasRoomEverLive returns true if the room was ever set to live or has an ended_at timestamp.
+func (s *PGStore) WasRoomEverLive(ctx context.Context, roomID string) (bool, error) {
+	var isLive bool
+	var endedAt, lastActive *time.Time
+	err := s.pool.QueryRow(ctx,
+		`SELECT is_live, ended_at, last_active_at FROM rooms WHERE id = $1`, roomID,
+	).Scan(&isLive, &endedAt, &lastActive)
+	if err != nil {
+		return false, err
+	}
+	// Room was "ever live" if it's currently live, has ended, or has a last_active timestamp
+	return isLive || endedAt != nil || lastActive != nil, nil
+}
+
+// CleanupGhostRooms deletes rooms that were created but never went live
+// and are older than the given age. Returns the number of rooms deleted.
+func (s *PGStore) CleanupGhostRooms(ctx context.Context, olderThan time.Duration) (int, error) {
+	cutoff := time.Now().Add(-olderThan)
+	tag, err := s.pool.Exec(ctx, `
+		DELETE FROM rooms
+		WHERE is_live = false
+			AND ended_at IS NULL
+			AND last_active_at IS NULL
+			AND scheduled_start IS NULL
+			AND is_autoplay = false
+			AND created_at < $1`, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	return int(tag.RowsAffected()), nil
+}
+
 func (s *PGStore) UpdateRoomPolicy(ctx context.Context, roomID string, policy models.RequestPolicy) error {
 	_, err := s.pool.Exec(ctx,
 		`UPDATE rooms SET request_policy = $2 WHERE id = $1`,

@@ -189,6 +189,7 @@ func main() {
 		r.Post("/admin/rooms", adminH.CreateOfficialRoom)
 		r.Patch("/admin/rooms/{id}", adminH.UpdateRoom)
 		r.Post("/admin/rooms/{id}/shutdown", adminH.ShutdownRoom)
+		r.Delete("/admin/rooms/{id}", adminH.DeleteRoom)
 		r.Post("/admin/rooms/{id}/feature", adminH.SetFeatured)
 		r.Post("/admin/rooms/{id}/official", adminH.SetOfficial)
 
