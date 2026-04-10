@@ -79,6 +79,7 @@ type Track struct {
 	Source        TrackSource `json:"source"`
 	SourceURL     string      `json:"sourceUrl"`
 	AlbumGradient string      `json:"albumGradient"`
+	InfoSnippet   string      `json:"infoSnippet,omitempty"`
 	CreatedAt     time.Time   `json:"createdAt"`
 }
 
@@ -460,6 +461,7 @@ type AutoplayTrack struct {
 	Source        string `json:"source"`
 	SourceURL     string `json:"sourceUrl"`
 	AlbumGradient string `json:"albumGradient,omitempty"`
+	InfoSnippet   string `json:"infoSnippet,omitempty"`
 }
 
 type AutoplayPlaylist struct {

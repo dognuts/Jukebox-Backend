@@ -243,10 +243,10 @@ func (s *PGStore) UpdateRoomPolicy(ctx context.Context, roomID string, policy mo
 
 func (s *PGStore) UpsertTrack(ctx context.Context, t *models.Track) error {
 	_, err := s.pool.Exec(ctx, `
-		INSERT INTO tracks (id, title, artist, duration, source, source_url, album_gradient, created_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+		INSERT INTO tracks (id, title, artist, duration, source, source_url, album_gradient, info_snippet, created_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
 		ON CONFLICT (id) DO NOTHING`,
-		t.ID, t.Title, t.Artist, t.Duration, t.Source, t.SourceURL, t.AlbumGradient, t.CreatedAt,
+		t.ID, t.Title, t.Artist, t.Duration, t.Source, t.SourceURL, t.AlbumGradient, t.InfoSnippet, t.CreatedAt,
 	)
 	return err
 }
@@ -506,11 +506,11 @@ func (s *PGStore) SetNowPlaying(ctx context.Context, roomID, trackID string) err
 func (s *PGStore) GetNowPlaying(ctx context.Context, roomID string) (*models.Track, error) {
 	t := &models.Track{}
 	err := s.pool.QueryRow(ctx, `
-		SELECT t.id, t.title, t.artist, t.duration, t.source, t.source_url, t.album_gradient, t.created_at
+		SELECT t.id, t.title, t.artist, t.duration, t.source, t.source_url, t.album_gradient, t.info_snippet, t.created_at
 		FROM now_playing np
 		JOIN tracks t ON t.id = np.track_id
 		WHERE np.room_id = $1`, roomID,
-	).Scan(&t.ID, &t.Title, &t.Artist, &t.Duration, &t.Source, &t.SourceURL, &t.AlbumGradient, &t.CreatedAt)
+	).Scan(&t.ID, &t.Title, &t.Artist, &t.Duration, &t.Source, &t.SourceURL, &t.AlbumGradient, &t.InfoSnippet, &t.CreatedAt)
 	if err == pgx.ErrNoRows {
 		return nil, nil
 	}

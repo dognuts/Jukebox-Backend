@@ -186,6 +186,7 @@ func (s *SyncService) advanceAutoplay(ctx context.Context, roomID string, hub *w
 		Source:        models.TrackSource(autoTrack.Source),
 		SourceURL:     autoTrack.SourceURL,
 		AlbumGradient: autoTrack.AlbumGradient,
+		InfoSnippet:   autoTrack.InfoSnippet,
 		CreatedAt:     time.Now(),
 	}
 
