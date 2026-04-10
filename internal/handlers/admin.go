@@ -610,6 +610,108 @@ func (h *AdminHandler) UpdateLiveSnippets(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, playlist)
 }
 
+// PUT /api/admin/autoplay/rooms/{id}/live/tracks — replace the live playlist
+// tracks in place. Body: {"tracks": [...AutoplayTrack]}.
+//
+// This is the in-place editing path used by the admin "Edit Live Tracks"
+// panel: add a song, remove a song, or swap a track's source URL while the
+// room is on-air. The currently-playing track keeps playing the audio it
+// already loaded — we never yank a listener mid-track. The current_index
+// is reconciled against the now-playing track's source URL so that
+// auto-advance picks the right next track when the current one ends.
+//
+// Reconciliation rules:
+//   - If the now-playing track's source URL matches a track in the new list,
+//     current_index is set to (matchIdx + 1) % len so the next advance
+//     picks the track that follows it.
+//   - If no match (the playing track was removed or its URL replaced),
+//     current_index is clamped/wrapped to a valid bound. The current play
+//     finishes and the next advance picks whatever lives there now.
+//   - If the new list is empty, we 400 — admins should use Stop instead.
+func (h *AdminHandler) UpdateLiveTracks(w http.ResponseWriter, r *http.Request) {
+	if h.requireAdmin(r) == nil {
+		http.Error(w, "admin required", http.StatusForbidden)
+		return
+	}
+	roomID := chi.URLParam(r, "id")
+	ctx := r.Context()
+
+	var req struct {
+		Tracks []models.AutoplayTrack `json:"tracks"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+	if len(req.Tracks) == 0 {
+		http.Error(w, "tracks cannot be empty — use the stop endpoint to take a room offline", http.StatusBadRequest)
+		return
+	}
+
+	playlist, err := h.pg.GetAutoplayPlaylist(ctx, roomID, "live")
+	if err != nil || playlist == nil {
+		http.Error(w, "no live playlist", http.StatusNotFound)
+		return
+	}
+
+	// Reconcile current_index against the now-playing track's source URL.
+	nowPlaying, _ := h.pg.GetNowPlaying(ctx, roomID)
+	newIndex := playlist.CurrentIndex
+	if nowPlaying != nil && nowPlaying.SourceURL != "" {
+		matchIdx := -1
+		for i, t := range req.Tracks {
+			if t.SourceURL == nowPlaying.SourceURL {
+				matchIdx = i
+				break
+			}
+		}
+		if matchIdx >= 0 {
+			newIndex = (matchIdx + 1) % len(req.Tracks)
+		}
+	}
+	// Always clamp into bounds in case the old index was past the new end.
+	if newIndex < 0 || newIndex >= len(req.Tracks) {
+		newIndex = newIndex % len(req.Tracks)
+		if newIndex < 0 {
+			newIndex += len(req.Tracks)
+		}
+	}
+
+	playlist.Tracks = req.Tracks
+	playlist.CurrentIndex = newIndex
+	if err := h.pg.SaveAutoplayPlaylist(ctx, playlist); err != nil {
+		log.Printf("update live tracks: %v", err)
+		http.Error(w, "failed to save", http.StatusInternalServerError)
+		return
+	}
+
+	// If the currently-playing track is still in the new list, propagate any
+	// metadata edits (title/artist/snippet) to the live tracks row so the
+	// listener UI updates without a track change.
+	if nowPlaying != nil && nowPlaying.SourceURL != "" {
+		for _, t := range req.Tracks {
+			if t.SourceURL != nowPlaying.SourceURL {
+				continue
+			}
+			if t.InfoSnippet != nowPlaying.InfoSnippet {
+				_ = h.pg.UpdateTrackInfoSnippet(ctx, nowPlaying.ID, t.InfoSnippet)
+				if hub := h.hubs.Get(roomID); hub != nil {
+					hub.BroadcastJSON(ws.WSMessage{
+						Event: ws.EventTrackInfoUpdate,
+						Payload: map[string]string{
+							"id":          nowPlaying.ID,
+							"infoSnippet": t.InfoSnippet,
+						},
+					})
+				}
+			}
+			break
+		}
+	}
+
+	writeJSON(w, http.StatusOK, playlist)
+}
+
 // parseAutoplayTrackIndex extracts the playlist index encoded in autoplay
 // track IDs of the form "auto-{roomIDPrefix}-{idx}-{timestamp}". Returns
 // (0,false) for any other ID shape.
