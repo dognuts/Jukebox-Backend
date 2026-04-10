@@ -266,7 +266,7 @@ func (h *AdminHandler) SetOfficial(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"official": req.Official})
 }
 
-// PATCH /api/admin/rooms/{id} — update room settings (expiry, schedule, etc)
+// PATCH /api/admin/rooms/{id} — update room settings (expiry, cover art, etc)
 func (h *AdminHandler) UpdateRoom(w http.ResponseWriter, r *http.Request) {
 	if h.requireAdmin(r) == nil {
 		http.Error(w, "admin required", http.StatusForbidden)
@@ -274,9 +274,14 @@ func (h *AdminHandler) UpdateRoom(w http.ResponseWriter, r *http.Request) {
 	}
 	roomID := chi.URLParam(r, "id")
 	var req struct {
-		ExpiresAt *string `json:"expiresAt"` // null = eternal
+		ExpiresAt     *string `json:"expiresAt"` // null = eternal
+		CoverArt      *string `json:"coverArt,omitempty"`
+		CoverGradient *string `json:"coverGradient,omitempty"`
 	}
-	json.NewDecoder(r.Body).Decode(&req)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
 
 	ctx := r.Context()
 	if req.ExpiresAt != nil {
@@ -289,7 +294,27 @@ func (h *AdminHandler) UpdateRoom(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "updated"})
+	if req.CoverArt != nil {
+		if err := h.pg.SetRoomCoverArt(ctx, roomID, *req.CoverArt); err != nil {
+			log.Printf("admin update cover art: %v", err)
+			http.Error(w, "failed to update cover art", http.StatusInternalServerError)
+			return
+		}
+	}
+	if req.CoverGradient != nil {
+		if err := h.pg.SetRoomCoverGradient(ctx, roomID, *req.CoverGradient); err != nil {
+			log.Printf("admin update cover gradient: %v", err)
+			http.Error(w, "failed to update cover gradient", http.StatusInternalServerError)
+			return
+		}
+	}
+
+	room, err := h.pg.GetRoomByID(ctx, roomID)
+	if err != nil || room == nil {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "updated"})
+		return
+	}
+	writeJSON(w, http.StatusOK, room)
 }
 
 // GET /api/admin/featured — get the current featured room (or auto-pick by listener count)

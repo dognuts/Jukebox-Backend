@@ -382,6 +382,16 @@ func (s *PGStore) SetRoomExpiry(ctx context.Context, roomID string, expiresAt *t
 	return err
 }
 
+func (s *PGStore) SetRoomCoverArt(ctx context.Context, roomID string, coverArtURL string) error {
+	_, err := s.pool.Exec(ctx, `UPDATE rooms SET cover_art_url = $2 WHERE id = $1`, roomID, coverArtURL)
+	return err
+}
+
+func (s *PGStore) SetRoomCoverGradient(ctx context.Context, roomID string, gradient string) error {
+	_, err := s.pool.Exec(ctx, `UPDATE rooms SET cover_gradient = $2 WHERE id = $1`, roomID, gradient)
+	return err
+}
+
 func (s *PGStore) GetFeaturedRoom(ctx context.Context) (*models.Room, error) {
 	row := s.pool.QueryRow(ctx, `SELECT `+roomColumns+` FROM rooms WHERE is_featured = true AND is_live = true LIMIT 1`)
 	r, err := scanRoom(row)
