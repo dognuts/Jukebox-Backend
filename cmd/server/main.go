@@ -217,6 +217,7 @@ func main() {
 		r.Patch("/admin/autoplay/rooms/{id}/live/snippets", adminH.UpdateLiveSnippets)
 		r.Post("/admin/autoplay/rooms/{id}/activate", adminH.ActivatePlaylist)
 		r.Delete("/admin/autoplay/rooms/{id}/staged", adminH.DeleteStagedPlaylist)
+		r.Post("/admin/autoplay/rooms/{id}/start", adminH.StartAutoplayRoom)
 		r.Post("/admin/autoplay/rooms/{id}/stop", adminH.StopAutoplayRoom)
 
 		// Featured room (public)

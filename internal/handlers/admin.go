@@ -664,6 +664,38 @@ func (h *AdminHandler) DeleteStagedPlaylist(w http.ResponseWriter, r *http.Reque
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
+// POST /api/admin/autoplay/rooms/{id}/start — relaunch a stopped autoplay
+// room using its existing live playlist. No-op (with 200) if the room is
+// already running.
+func (h *AdminHandler) StartAutoplayRoom(w http.ResponseWriter, r *http.Request) {
+	if h.requireAdmin(r) == nil {
+		http.Error(w, "admin required", http.StatusForbidden)
+		return
+	}
+	roomID := chi.URLParam(r, "id")
+	ctx := r.Context()
+
+	playlist, err := h.pg.GetAutoplayPlaylist(ctx, roomID, "live")
+	if err != nil {
+		log.Printf("start autoplay room: load live playlist: %v", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if playlist == nil || len(playlist.Tracks) == 0 {
+		http.Error(w, "no live playlist with tracks — build a staged playlist and activate it first", http.StatusBadRequest)
+		return
+	}
+
+	if err := h.pg.SetRoomAutoplay(ctx, roomID, true); err != nil {
+		log.Printf("start autoplay room: set autoplay: %v", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	h.playback.StartAutoplayRooms(ctx)
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "started"})
+}
+
 // POST /api/admin/autoplay/rooms/{id}/stop — stop an autoplay room
 func (h *AdminHandler) StopAutoplayRoom(w http.ResponseWriter, r *http.Request) {
 	if h.requireAdmin(r) == nil {
