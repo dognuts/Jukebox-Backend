@@ -53,7 +53,7 @@ func (s *PGStore) ResetAllRoomsOffline(ctx context.Context) error {
 
 // RunMigrations reads and executes the migration files in order.
 func (s *PGStore) RunMigrations(ctx context.Context, migrationsDir string) error {
-	files := []string{"001_initial.up.sql", "002_user_accounts.up.sql", "003_messages_playlists.up.sql", "004_room_ended.up.sql", "005_admin.up.sql", "006_location_listen.up.sql", "007_stage_name.up.sql", "008_unique_stage_name.up.sql", "009_monetization.up.sql", "010_add_banned.up.sql", "011_autoplay.up.sql"}
+	files := []string{"001_initial.up.sql", "002_user_accounts.up.sql", "003_messages_playlists.up.sql", "004_room_ended.up.sql", "005_admin.up.sql", "006_location_listen.up.sql", "007_stage_name.up.sql", "008_unique_stage_name.up.sql", "009_monetization.up.sql", "010_add_banned.up.sql", "011_autoplay.up.sql", "012_track_info_snippet.up.sql"}
 	for _, f := range files {
 		data, err := os.ReadFile(migrationsDir + "/" + f)
 		if err != nil {
