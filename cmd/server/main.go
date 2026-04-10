@@ -214,6 +214,7 @@ func main() {
 		r.Get("/admin/metrics", adminH.GetMetrics)
 		r.Get("/admin/autoplay/rooms/{id}/playlists", adminH.GetAutoplayPlaylists)
 		r.Put("/admin/autoplay/rooms/{id}/staged", adminH.SaveStagedPlaylist)
+		r.Patch("/admin/autoplay/rooms/{id}/live/snippets", adminH.UpdateLiveSnippets)
 		r.Post("/admin/autoplay/rooms/{id}/activate", adminH.ActivatePlaylist)
 		r.Delete("/admin/autoplay/rooms/{id}/staged", adminH.DeleteStagedPlaylist)
 		r.Post("/admin/autoplay/rooms/{id}/stop", adminH.StopAutoplayRoom)

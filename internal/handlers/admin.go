@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -540,6 +541,91 @@ func (h *AdminHandler) SaveStagedPlaylist(w http.ResponseWriter, r *http.Request
 		return
 	}
 	writeJSON(w, http.StatusOK, playlist)
+}
+
+// PATCH /api/admin/autoplay/rooms/{id}/live/snippets — update info snippets
+// on the LIVE playlist in place. Body: {"snippets": ["...", "...", ...]}.
+// The snippets array is positional — index N maps to track N in the live
+// playlist. Send "" to clear a snippet. Tracks past the array length are
+// left alone. If the snippet for the currently playing track changed, the
+// tracks row is patched and a track_info_updated WS event is broadcast so
+// listeners see it immediately.
+func (h *AdminHandler) UpdateLiveSnippets(w http.ResponseWriter, r *http.Request) {
+	if h.requireAdmin(r) == nil {
+		http.Error(w, "admin required", http.StatusForbidden)
+		return
+	}
+	roomID := chi.URLParam(r, "id")
+	ctx := r.Context()
+
+	var req struct {
+		Snippets []string `json:"snippets"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	playlist, err := h.pg.GetAutoplayPlaylist(ctx, roomID, "live")
+	if err != nil || playlist == nil {
+		http.Error(w, "no live playlist", http.StatusNotFound)
+		return
+	}
+
+	// Apply snippet edits in place. Only touch indices we actually received.
+	for i := range playlist.Tracks {
+		if i >= len(req.Snippets) {
+			break
+		}
+		playlist.Tracks[i].InfoSnippet = req.Snippets[i]
+	}
+
+	if err := h.pg.SaveAutoplayPlaylist(ctx, playlist); err != nil {
+		log.Printf("update live snippets: %v", err)
+		http.Error(w, "failed to save", http.StatusInternalServerError)
+		return
+	}
+
+	// If the currently playing track is one we just edited, patch the
+	// tracks-table row and tell live listeners about it.
+	nowPlaying, _ := h.pg.GetNowPlaying(ctx, roomID)
+	if nowPlaying != nil {
+		if idx, ok := parseAutoplayTrackIndex(nowPlaying.ID); ok && idx < len(playlist.Tracks) {
+			newSnippet := playlist.Tracks[idx].InfoSnippet
+			if newSnippet != nowPlaying.InfoSnippet {
+				_ = h.pg.UpdateTrackInfoSnippet(ctx, nowPlaying.ID, newSnippet)
+				if hub := h.hubs.Get(roomID); hub != nil {
+					hub.BroadcastJSON(ws.WSMessage{
+						Event: ws.EventTrackInfoUpdate,
+						Payload: map[string]string{
+							"id":          nowPlaying.ID,
+							"infoSnippet": newSnippet,
+						},
+					})
+				}
+			}
+		}
+	}
+
+	writeJSON(w, http.StatusOK, playlist)
+}
+
+// parseAutoplayTrackIndex extracts the playlist index encoded in autoplay
+// track IDs of the form "auto-{roomIDPrefix}-{idx}-{timestamp}". Returns
+// (0,false) for any other ID shape.
+func parseAutoplayTrackIndex(trackID string) (int, bool) {
+	if !strings.HasPrefix(trackID, "auto-") {
+		return 0, false
+	}
+	parts := strings.Split(trackID, "-")
+	if len(parts) < 4 {
+		return 0, false
+	}
+	idx, err := strconv.Atoi(parts[2])
+	if err != nil || idx < 0 {
+		return 0, false
+	}
+	return idx, true
 }
 
 // POST /api/admin/autoplay/rooms/{id}/activate — promote staged to live

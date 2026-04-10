@@ -5,9 +5,10 @@ import "encoding/json"
 // Event types sent over WebSocket
 const (
 	// Server -> Client events
-	EventPlaybackState = "playback_state"
-	EventTrackChanged  = "track_changed"
-	EventQueueUpdate   = "queue_update"
+	EventPlaybackState   = "playback_state"
+	EventTrackChanged    = "track_changed"
+	EventTrackInfoUpdate = "track_info_updated"
+	EventQueueUpdate     = "queue_update"
 	EventChatMessage   = "chat_message"
 	EventListenerCount = "listener_count"
 	EventRoomSettings  = "room_settings"

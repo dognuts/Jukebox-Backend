@@ -257,6 +257,12 @@ func (s *PGStore) UpdateTrackDuration(ctx context.Context, trackID string, durat
 	return err
 }
 
+func (s *PGStore) UpdateTrackInfoSnippet(ctx context.Context, trackID string, snippet string) error {
+	_, err := s.pool.Exec(ctx,
+		`UPDATE tracks SET info_snippet = $2 WHERE id = $1`, trackID, snippet)
+	return err
+}
+
 func (s *PGStore) GetTrack(ctx context.Context, id string) (*models.Track, error) {
 	t := &models.Track{}
 	err := s.pool.QueryRow(ctx, `
