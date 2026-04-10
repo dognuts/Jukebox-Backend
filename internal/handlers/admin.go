@@ -279,7 +279,8 @@ func (h *AdminHandler) UpdateRoom(w http.ResponseWriter, r *http.Request) {
 		CoverGradient *string `json:"coverGradient,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		log.Printf("admin update room %s: decode error: %v (content-length=%s)", roomID, err, r.Header.Get("Content-Length"))
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 
