@@ -240,7 +240,7 @@ type PlaylistTrack struct {
 	ID            string `json:"id"`
 	TrackID       string `json:"trackId"`
 	Position      int    `json:"position"`
-	AddedAt       string `json:"addedAt"`
+	AddedAt       time.Time `json:"addedAt"`
 	// Joined from tracks table
 	Title         string `json:"title,omitempty"`
 	Artist        string `json:"artist,omitempty"`
