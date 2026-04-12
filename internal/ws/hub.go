@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -249,7 +251,12 @@ func (h *Hub) handleInbound(cm *ClientMessage) {
 	switch msg.Action {
 	case ActionSendChat:
 		var p ChatPayload
-		if err := json.Unmarshal(msg.Payload, &p); err != nil || p.Message == "" {
+		if err := json.Unmarshal(msg.Payload, &p); err != nil {
+			client.sendError("invalid chat message")
+			return
+		}
+		// Must have either a text message or a media URL
+		if p.Message == "" && p.MediaURL == "" {
 			client.sendError("invalid chat message")
 			return
 		}
@@ -257,6 +264,44 @@ func (h *Hub) handleInbound(cm *ClientMessage) {
 			client.sendError("message too long (max 500 chars)")
 			return
 		}
+
+		// Validate media URL if present — only allow GIPHY domains
+		var mediaURL, mediaType string
+		if p.MediaURL != "" {
+			parsed, err := url.Parse(p.MediaURL)
+			if err != nil || (parsed.Scheme != "https") {
+				client.sendError("media URL must be HTTPS")
+				return
+			}
+			host := strings.ToLower(parsed.Hostname())
+			allowed := false
+			allowedHosts := []string{
+				"media.giphy.com",
+				"i.giphy.com",
+				"media0.giphy.com",
+				"media1.giphy.com",
+				"media2.giphy.com",
+				"media3.giphy.com",
+				"media4.giphy.com",
+			}
+			for _, h := range allowedHosts {
+				if host == h {
+					allowed = true
+					break
+				}
+			}
+			if !allowed {
+				client.sendError("media URL domain not allowed")
+				return
+			}
+			mediaURL = p.MediaURL
+			if p.MediaType == "gif" || p.MediaType == "image" {
+				mediaType = p.MediaType
+			} else {
+				mediaType = "gif" // default to gif for GIPHY URLs
+			}
+		}
+
 		// Rate limit: max 1 message per 500ms per client
 		now := time.Now()
 		if now.Sub(client.LastChat) < 500*time.Millisecond {
@@ -274,6 +319,8 @@ func (h *Hub) handleInbound(cm *ClientMessage) {
 			Message:     p.Message,
 			Type:        models.ChatTypeMessage,
 			Timestamp:   time.Now(),
+			MediaURL:    mediaURL,
+			MediaType:   mediaType,
 		}
 
 		if err := h.pg.InsertChatMessage(ctx, chatMsg); err != nil {

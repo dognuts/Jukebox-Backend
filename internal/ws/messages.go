@@ -55,7 +55,9 @@ type InboundMessage struct {
 // Typed payloads for inbound actions
 
 type ChatPayload struct {
-	Message string `json:"message"`
+	Message   string `json:"message"`
+	MediaURL  string `json:"mediaUrl,omitempty"`
+	MediaType string `json:"mediaType,omitempty"`
 }
 
 type SubmitTrackPayload struct {

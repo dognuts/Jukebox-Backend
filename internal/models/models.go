@@ -103,6 +103,8 @@ type ChatMessage struct {
 	Message     string          `json:"message"`
 	Type        ChatMessageType `json:"type"`
 	Timestamp   time.Time       `json:"timestamp"`
+	MediaURL    string          `json:"mediaUrl,omitempty"`
+	MediaType   string          `json:"mediaType,omitempty"`
 }
 
 // ---------- Session (anonymous identity) ----------

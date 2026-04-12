@@ -12,6 +12,15 @@ import (
 	"github.com/jukebox/backend/internal/models"
 )
 
+// nilIfEmpty returns nil for empty strings so nullable TEXT columns
+// store NULL instead of an empty string.
+func nilIfEmpty(s string) interface{} {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
 type PGStore struct {
 	pool *pgxpool.Pool
 }
@@ -459,17 +468,19 @@ func (s *PGStore) GetAllSessionTracks(ctx context.Context, roomID string) ([]mod
 
 func (s *PGStore) InsertChatMessage(ctx context.Context, msg *models.ChatMessage) error {
 	_, err := s.pool.Exec(ctx, `
-		INSERT INTO chat_messages (id, room_id, session_id, username, avatar_color, message, msg_type, created_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+		INSERT INTO chat_messages (id, room_id, session_id, username, avatar_color, message, msg_type, created_at, media_url, media_type)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
 		msg.ID, msg.RoomID, msg.SessionID, msg.Username, msg.AvatarColor,
 		msg.Message, msg.Type, msg.Timestamp,
+		nilIfEmpty(msg.MediaURL), nilIfEmpty(msg.MediaType),
 	)
 	return err
 }
 
 func (s *PGStore) GetRecentChat(ctx context.Context, roomID string, limit int) ([]models.ChatMessage, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, room_id, session_id, username, avatar_color, message, msg_type, created_at
+		SELECT id, room_id, session_id, username, avatar_color, message, msg_type, created_at,
+		       COALESCE(media_url, ''), COALESCE(media_type, '')
 		FROM chat_messages
 		WHERE room_id = $1
 		ORDER BY created_at DESC
@@ -485,6 +496,7 @@ func (s *PGStore) GetRecentChat(ctx context.Context, roomID string, limit int) (
 		if err := rows.Scan(
 			&m.ID, &m.RoomID, &m.SessionID, &m.Username, &m.AvatarColor,
 			&m.Message, &m.Type, &m.Timestamp,
+			&m.MediaURL, &m.MediaType,
 		); err != nil {
 			return nil, err
 		}
