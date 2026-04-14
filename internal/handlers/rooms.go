@@ -206,7 +206,8 @@ func (h *RoomHandler) List(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	type RoomWithNowPlaying struct {
 		models.Room
-		NowPlaying *models.Track `json:"nowPlaying,omitempty"`
+		NowPlaying *models.Track         `json:"nowPlaying,omitempty"`
+		RecentChat []models.ChatMessage  `json:"recentChat,omitempty"`
 	}
 
 	// Batch Redis reads: one pipeline for listener counts across all rooms,
@@ -240,6 +241,35 @@ func (h *RoomHandler) List(w http.ResponseWriter, r *http.Request) {
 
 	if result == nil {
 		result = []RoomWithNowPlaying{}
+	}
+
+	// Attach a small chat preview to the featured room so the homepage
+	// can render the featured card at final size in one pass. Mirrors
+	// the frontend's featured-picking logic: IsFeatured flag wins,
+	// otherwise the live room with the most listeners.
+	featuredIdx := -1
+	for i := range result {
+		if result[i].IsLive && result[i].IsFeatured {
+			featuredIdx = i
+			break
+		}
+	}
+	if featuredIdx < 0 {
+		var best int
+		for i := range result {
+			if !result[i].IsLive {
+				continue
+			}
+			if featuredIdx < 0 || result[i].ListenerCount > best {
+				featuredIdx = i
+				best = result[i].ListenerCount
+			}
+		}
+	}
+	if featuredIdx >= 0 {
+		if chat, _ := h.pg.GetRecentChat(ctx, result[featuredIdx].ID, 3); chat != nil {
+			result[featuredIdx].RecentChat = chat
+		}
 	}
 
 	writeJSON(w, http.StatusOK, result)
