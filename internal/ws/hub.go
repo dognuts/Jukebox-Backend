@@ -191,53 +191,84 @@ func (h *Hub) sendInitialState(client *Client) {
 
 	ctx := context.Background()
 
-	// Playback state
-	ps, _ := h.redis.GetPlaybackState(ctx, h.RoomID)
-	if ps != nil {
-		// Send current track info FIRST so the client can start loading the player
-		// before the playback state tells it where to seek
-		if ps.TrackID != "" {
-			track, _ := h.pg.GetTrack(ctx, ps.TrackID)
-			if track != nil {
-				client.SendJSON(WSMessage{Event: EventTrackChanged, Payload: track})
-			}
-		}
+	// Fan out all reads in parallel — previously this path did ~7
+	// sequential round-trips to Redis and Postgres. With them fanned
+	// out, the join latency is bounded by the slowest single call
+	// instead of their sum.
+	var (
+		wg sync.WaitGroup
 
-		// Now send playback state — client already has the track loaded
+		ps      *models.PlaybackState
+		track   *models.Track
+		queue   []models.QueueEntry
+		chat    []models.ChatMessage
+		room    *models.Room
+		pending []models.QueueEntry
+		tube    *models.NeonTube
+	)
+
+	wg.Add(5)
+	go func() {
+		defer wg.Done()
+		ps, _ = h.redis.GetPlaybackState(ctx, h.RoomID)
+		if ps != nil && ps.TrackID != "" {
+			track, _ = h.pg.GetTrack(ctx, ps.TrackID)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		queue, _ = h.pg.GetQueue(ctx, h.RoomID)
+	}()
+	go func() {
+		defer wg.Done()
+		chat, _ = h.pg.GetRecentChat(ctx, h.RoomID, 50)
+	}()
+	go func() {
+		defer wg.Done()
+		room, _ = h.pg.GetRoomByID(ctx, h.RoomID)
+	}()
+	go func() {
+		defer wg.Done()
+		tube, _ = h.pg.GetNeonTube(ctx, h.RoomID)
+	}()
+
+	if client.IsDJ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			pending, _ = h.pg.GetPendingRequests(ctx, h.RoomID)
+		}()
+	}
+
+	wg.Wait()
+
+	// Dispatch sends in the original order so the client receives them
+	// in the expected sequence (track info before playback state, etc).
+	if ps != nil {
+		if track != nil {
+			client.SendJSON(WSMessage{Event: EventTrackChanged, Payload: track})
+		}
 		client.SendJSON(WSMessage{Event: EventPlaybackState, Payload: ps})
 	}
 
-	// Current queue
-	queue, _ := h.pg.GetQueue(ctx, h.RoomID)
 	client.SendJSON(WSMessage{Event: EventQueueUpdate, Payload: queue})
 
-	// Recent chat
-	chat, _ := h.pg.GetRecentChat(ctx, h.RoomID, 50)
 	for _, msg := range chat {
 		client.SendJSON(WSMessage{Event: EventChatMessage, Payload: msg})
 	}
 
-	// Room settings
-	room, _ := h.pg.GetRoomByID(ctx, h.RoomID)
 	if room != nil {
 		client.SendJSON(WSMessage{Event: EventRoomSettings, Payload: map[string]interface{}{
 			"requestPolicy": room.RequestPolicy,
 		}})
 	}
 
-	// If DJ, send pending requests
-	if client.IsDJ {
-		pending, _ := h.pg.GetPendingRequests(ctx, h.RoomID)
-		if len(pending) > 0 {
-			client.SendJSON(WSMessage{Event: EventRequestUpdate, Payload: pending})
-		}
+	if client.IsDJ && len(pending) > 0 {
+		client.SendJSON(WSMessage{Event: EventRequestUpdate, Payload: pending})
 	}
 
-	// Send current listener list
 	h.broadcastListenerList()
 
-	// Send current neon tube state
-	tube, _ := h.pg.GetNeonTube(ctx, h.RoomID)
 	if tube != nil {
 		client.SendJSON(WSMessage{Event: "tube_update", Payload: tube})
 	}
