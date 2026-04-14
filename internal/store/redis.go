@@ -211,6 +211,51 @@ func (r *RedisStore) GetListenerCount(ctx context.Context, roomID string) (int64
 	return r.client.SCard(ctx, "listeners:"+roomID).Result()
 }
 
+// GetListenerCounts pipelines SCard for many rooms into one round-trip.
+// Returns a map roomID -> count. Missing rooms map to 0.
+func (r *RedisStore) GetListenerCounts(ctx context.Context, roomIDs []string) map[string]int64 {
+	out := make(map[string]int64, len(roomIDs))
+	if len(roomIDs) == 0 {
+		return out
+	}
+	pipe := r.client.Pipeline()
+	cmds := make([]*redis.IntCmd, len(roomIDs))
+	for i, id := range roomIDs {
+		cmds[i] = pipe.SCard(ctx, "listeners:"+id)
+	}
+	_, _ = pipe.Exec(ctx)
+	for i, id := range roomIDs {
+		out[id], _ = cmds[i].Result()
+	}
+	return out
+}
+
+// GetPlaybackStates pipelines GET for many rooms into one round-trip.
+// Returns a map roomID -> *PlaybackState (nil entries omitted).
+func (r *RedisStore) GetPlaybackStates(ctx context.Context, roomIDs []string) map[string]*models.PlaybackState {
+	out := make(map[string]*models.PlaybackState, len(roomIDs))
+	if len(roomIDs) == 0 {
+		return out
+	}
+	pipe := r.client.Pipeline()
+	cmds := make([]*redis.StringCmd, len(roomIDs))
+	for i, id := range roomIDs {
+		cmds[i] = pipe.Get(ctx, "playback:"+id)
+	}
+	_, _ = pipe.Exec(ctx)
+	for i, id := range roomIDs {
+		data, err := cmds[i].Result()
+		if err != nil || data == "" {
+			continue
+		}
+		var ps models.PlaybackState
+		if err := json.Unmarshal([]byte(data), &ps); err == nil {
+			out[id] = &ps
+		}
+	}
+	return out
+}
+
 func (r *RedisStore) ClearListeners(ctx context.Context, roomID string) error {
 	return r.client.Del(ctx, "listeners:"+roomID).Err()
 }

@@ -96,9 +96,18 @@ func AuthMiddleware(secret string, pg *store.PGStore) func(http.Handler) http.Ha
 				tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
 				claims, err := ValidateAccessToken(tokenStr, secret)
 				if err == nil {
-					// Load full user from DB
-					user, err := pg.GetUserByID(ctx, claims.UserID)
-					if err == nil && user != nil {
+					// Cache lookup first — most requests within the short
+					// cache TTL skip Postgres entirely. Mutating endpoints
+					// call InvalidateCachedUser(uid) after writes so the
+					// next request sees fresh data.
+					user := getCachedUser(claims.UserID)
+					if user == nil {
+						user, err = pg.GetUserByID(ctx, claims.UserID)
+						if err == nil && user != nil {
+							putCachedUser(claims.UserID, user)
+						}
+					}
+					if user != nil {
 						ctx = context.WithValue(ctx, UserKey, user)
 					}
 				}

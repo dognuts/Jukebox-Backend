@@ -22,33 +22,40 @@ func SessionMiddleware(redis *store.RedisStore) func(http.Handler) http.Handler 
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			ctx := r.Context()
 
-			// Try to load existing session from cookie
+			// resolve tries cache first, falls back to Redis and stores the
+			// result in cache on hit. The Redis TTL refresh is fired only on
+			// cache miss — the cache's own TTL bounds how stale the session
+			// can get without any refresh, which is acceptable here because
+			// Redis sessions outlive the cache by orders of magnitude.
+			resolve := func(sid string) *models.Session {
+				if s := getCachedSession(sid); s != nil {
+					return s
+				}
+				s, _ := redis.GetSession(ctx, sid)
+				if s != nil {
+					_ = redis.RefreshSession(ctx, s.ID)
+					putCachedSession(sid, s)
+				}
+				return s
+			}
+
+			// Try cookie
 			var session *models.Session
 			if cookie, err := r.Cookie(cookieName); err == nil && cookie.Value != "" {
-				session, _ = redis.GetSession(ctx, cookie.Value)
-				if session != nil {
-					// Refresh TTL
-					_ = redis.RefreshSession(ctx, session.ID)
-				}
+				session = resolve(cookie.Value)
 			}
 
 			// Also check query param (for WebSocket connections where cookies may not be sent cross-origin)
 			if session == nil {
 				if sid := r.URL.Query().Get("session"); sid != "" {
-					session, _ = redis.GetSession(ctx, sid)
-					if session != nil {
-						_ = redis.RefreshSession(ctx, session.ID)
-					}
+					session = resolve(sid)
 				}
 			}
 
 			// Also check Authorization header (for non-browser clients)
 			if session == nil {
 				if sid := r.Header.Get("X-Session-ID"); sid != "" {
-					session, _ = redis.GetSession(ctx, sid)
-					if session != nil {
-						_ = redis.RefreshSession(ctx, session.ID)
-					}
+					session = resolve(sid)
 				}
 			}
 
@@ -60,6 +67,7 @@ func SessionMiddleware(redis *store.RedisStore) func(http.Handler) http.Handler 
 					http.Error(w, "failed to create session", http.StatusInternalServerError)
 					return
 				}
+				putCachedSession(session.ID, session)
 				http.SetCookie(w, &http.Cookie{
 					Name:     cookieName,
 					Value:    session.ID,

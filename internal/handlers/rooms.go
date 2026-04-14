@@ -209,16 +209,27 @@ func (h *RoomHandler) List(w http.ResponseWriter, r *http.Request) {
 		NowPlaying *models.Track `json:"nowPlaying,omitempty"`
 	}
 
+	// Batch Redis reads: one pipeline for listener counts across all rooms,
+	// one pipeline for playback state across live rooms. Reduces what used
+	// to be O(2n) sequential round-trips to two.
+	allIDs := make([]string, len(rooms))
+	liveIDs := make([]string, 0, len(rooms))
+	for i := range rooms {
+		allIDs[i] = rooms[i].ID
+		if rooms[i].IsLive {
+			liveIDs = append(liveIDs, rooms[i].ID)
+		}
+	}
+	counts := h.redis.GetListenerCounts(ctx, allIDs)
+	playbacks := h.redis.GetPlaybackStates(ctx, liveIDs)
+
 	result := make([]RoomWithNowPlaying, len(rooms))
 	for i := range rooms {
-		count, _ := h.redis.GetListenerCount(ctx, rooms[i].ID)
-		rooms[i].ListenerCount = int(count)
+		rooms[i].ListenerCount = int(counts[rooms[i].ID])
 		result[i] = RoomWithNowPlaying{Room: rooms[i]}
 
-		// Get now-playing track if room is live
 		if rooms[i].IsLive {
-			ps, _ := h.redis.GetPlaybackState(ctx, rooms[i].ID)
-			if ps != nil && ps.TrackID != "" {
+			if ps := playbacks[rooms[i].ID]; ps != nil && ps.TrackID != "" {
 				track, _ := h.pg.GetTrack(ctx, ps.TrackID)
 				if track != nil {
 					result[i].NowPlaying = track
