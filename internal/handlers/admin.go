@@ -664,6 +664,11 @@ func (h *AdminHandler) UpdateLiveTracks(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// Reconcile current_index against the now-playing track's source URL.
+	// current_index stores the CURRENTLY-PLAYING index (not "next"), so we
+	// want to point at the matched row — the next advance will move to the
+	// following track. If the playing track was removed from the new list,
+	// clamp to something in range so the next advance still picks a valid
+	// track.
 	nowPlaying, _ := h.pg.GetNowPlaying(ctx, roomID)
 	newIndex := playlist.CurrentIndex
 	if nowPlaying != nil && nowPlaying.SourceURL != "" {
@@ -675,15 +680,16 @@ func (h *AdminHandler) UpdateLiveTracks(w http.ResponseWriter, r *http.Request) 
 			}
 		}
 		if matchIdx >= 0 {
-			newIndex = (matchIdx + 1) % len(req.Tracks)
+			newIndex = matchIdx
 		}
 	}
-	// Always clamp into bounds in case the old index was past the new end.
-	if newIndex < 0 || newIndex >= len(req.Tracks) {
-		newIndex = newIndex % len(req.Tracks)
-		if newIndex < 0 {
-			newIndex += len(req.Tracks)
-		}
+	// Clamp into [-1, len). -1 is the "nothing played yet" sentinel and is
+	// left alone; otherwise wrap into [0, len).
+	if newIndex >= len(req.Tracks) {
+		newIndex = len(req.Tracks) - 1
+	}
+	if newIndex < -1 {
+		newIndex = -1
 	}
 
 	playlist.Tracks = req.Tracks
@@ -756,6 +762,15 @@ func (h *AdminHandler) ActivatePlaylist(w http.ResponseWriter, r *http.Request) 
 
 	// Mark room as live and autoplay
 	h.pg.SetRoomAutoplay(ctx, roomID, true)
+
+	// Clear any stale state from the previous playlist so the fresh one
+	// starts cleanly at track 0. Without this, StartAutoplayRooms sees the
+	// old playback state in Redis and resumes mid-track instead of advancing
+	// to the new playlist's first track — cause of the "started a few songs
+	// down" issue reported 2026-04-22.
+	h.playback.CancelAdvance(roomID)
+	h.redis.ClearPlaybackState(ctx, roomID)
+	h.pg.ClearNowPlaying(ctx, roomID)
 
 	// Start playing the first track
 	h.playback.StartAutoplayRooms(ctx)

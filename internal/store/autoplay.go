@@ -97,10 +97,13 @@ func (s *PGStore) ActivateStagedPlaylist(ctx context.Context, roomID string) (*m
 		return nil, fmt.Errorf("delete old live: %w", err)
 	}
 
-	// Promote staged → live, reset index to 0
+	// Promote staged → live, reset index to -1 (= "nothing played yet"). The
+	// first advance will read -1 and play track 0. current_index hereafter
+	// points to the CURRENTLY PLAYING track, so the admin UI's i ==
+	// currentIndex check highlights the right row.
 	now := time.Now()
 	_, err = tx.Exec(ctx,
-		`UPDATE autoplay_playlists SET status = 'live', current_index = 0, activated_at = $2 WHERE room_id = $1 AND status = 'staged'`,
+		`UPDATE autoplay_playlists SET status = 'live', current_index = -1, activated_at = $2 WHERE room_id = $1 AND status = 'staged'`,
 		roomID, now)
 	if err != nil {
 		return nil, fmt.Errorf("promote staged: %w", err)
@@ -120,23 +123,40 @@ func (s *PGStore) DeleteAutoplayPlaylist(ctx context.Context, roomID, status str
 	return err
 }
 
-// GetNextAutoplayTrack returns the next track from the live playlist, looping if needed.
-// Returns nil if no live playlist or empty tracks.
+// computeNextPlayIndex owns the "which track plays next?" rule. Pure helper
+// to keep the decision testable without a real Postgres.
+//
+// Convention: currentIndex is the CURRENTLY PLAYING index, or -1 if nothing
+// has played yet. ActivateStagedPlaylist seeds -1 so the first advance reads
+// it and plays track 0. Subsequent advances wrap via modulo.
+func computeNextPlayIndex(currentIndex, length int) int {
+	if length <= 0 {
+		return 0
+	}
+	if currentIndex < 0 {
+		return 0
+	}
+	return (currentIndex + 1) % length
+}
+
+// GetNextAutoplayTrack advances the live playlist to the next track, persists
+// the new currently-playing index, and returns the track. Loops on the last
+// track. Returns nil if there's no live playlist or it's empty.
 func (s *PGStore) GetNextAutoplayTrack(ctx context.Context, roomID string) (*models.AutoplayTrack, int, error) {
 	playlist, err := s.GetAutoplayPlaylist(ctx, roomID, "live")
 	if err != nil || playlist == nil || len(playlist.Tracks) == 0 {
 		return nil, 0, err
 	}
 
-	// Loop: wrap index around
-	idx := playlist.CurrentIndex % len(playlist.Tracks)
-	track := &playlist.Tracks[idx]
+	nextIdx := computeNextPlayIndex(playlist.CurrentIndex, len(playlist.Tracks))
+	track := &playlist.Tracks[nextIdx]
 
-	// Advance index for next call
-	nextIdx := (idx + 1) % len(playlist.Tracks)
+	// Persist the new currently-playing index — NOT "next to play." The admin
+	// UI highlights the row at current_index, so this must be the index the
+	// listener is actually hearing right now.
 	s.UpdateAutoplayIndex(ctx, roomID, nextIdx)
 
-	return track, idx, nil
+	return track, nextIdx, nil
 }
 
 // GetAutoplayRooms returns all rooms with is_autoplay = true.
