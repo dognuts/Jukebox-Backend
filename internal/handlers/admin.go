@@ -15,6 +15,7 @@ import (
 	"github.com/jukebox/backend/internal/playback"
 	"github.com/jukebox/backend/internal/store"
 	"github.com/jukebox/backend/internal/ws"
+	"github.com/jukebox/backend/internal/youtube"
 )
 
 type AdminHandler struct {
@@ -25,8 +26,17 @@ type AdminHandler struct {
 	yt       youtubeSearcher // nil when YOUTUBE_DATA_API_KEY unset
 }
 
-func NewAdminHandler(pg *store.PGStore, redis *store.RedisStore, hubs *ws.HubManager, pb *playback.SyncService, yt youtubeSearcher) *AdminHandler {
-	return &AdminHandler{pg: pg, redis: redis, hubs: hubs, playback: pb, yt: yt}
+// NewAdminHandler takes the concrete *youtube.Client (not the youtubeSearcher
+// interface) specifically to avoid the "typed nil in interface" Go pitfall:
+// if main.go passes a nil *youtube.Client into an interface-typed parameter,
+// the resulting interface value is NOT == nil and the nil check in the
+// handler would fail open, panicking at request time.
+func NewAdminHandler(pg *store.PGStore, redis *store.RedisStore, hubs *ws.HubManager, pb *playback.SyncService, yt *youtube.Client) *AdminHandler {
+	h := &AdminHandler{pg: pg, redis: redis, hubs: hubs, playback: pb}
+	if yt != nil {
+		h.yt = yt
+	}
+	return h
 }
 
 // requireAdmin checks that the requesting user is an admin.

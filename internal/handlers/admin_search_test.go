@@ -86,6 +86,21 @@ func TestSearchTrack_NotConfiguredReturns503(t *testing.T) {
 	}
 }
 
+// TestSearchTrack_TypedNilYTClient_ViaNewAdminHandler_Returns503 exercises
+// the real production construction path: main.go passes a nil *youtube.Client
+// to NewAdminHandler when YOUTUBE_DATA_API_KEY is unset. This previously
+// panicked (500) because a typed-nil pointer stored in an interface field is
+// not == nil — the handler's nil check missed it and dereferenced the pointer.
+func TestSearchTrack_TypedNilYTClient_ViaNewAdminHandler_Returns503(t *testing.T) {
+	var nilClient *youtube.Client // typed nil, simulates unconfigured env
+	h := NewAdminHandler(nil, nil, nil, nil, nilClient)
+	w := httptest.NewRecorder()
+	h.SearchTrack(w, requestWithUser(&models.User{IsAdmin: true}, "apache"))
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503 (typed-nil-in-interface regression guard)", w.Code)
+	}
+}
+
 func TestSearchTrack_NoResultsReturns204(t *testing.T) {
 	h := newSearchHandler(&fakeSearcher{err: youtube.ErrNoResults})
 	w := httptest.NewRecorder()
