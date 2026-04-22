@@ -22,10 +22,11 @@ type AdminHandler struct {
 	redis    *store.RedisStore
 	hubs     *ws.HubManager
 	playback *playback.SyncService
+	yt       youtubeSearcher // nil when YOUTUBE_DATA_API_KEY unset
 }
 
-func NewAdminHandler(pg *store.PGStore, redis *store.RedisStore, hubs *ws.HubManager, pb *playback.SyncService) *AdminHandler {
-	return &AdminHandler{pg: pg, redis: redis, hubs: hubs, playback: pb}
+func NewAdminHandler(pg *store.PGStore, redis *store.RedisStore, hubs *ws.HubManager, pb *playback.SyncService, yt youtubeSearcher) *AdminHandler {
+	return &AdminHandler{pg: pg, redis: redis, hubs: hubs, playback: pb, yt: yt}
 }
 
 // requireAdmin checks that the requesting user is an admin.

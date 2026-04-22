@@ -20,6 +20,7 @@ import (
 	"github.com/jukebox/backend/internal/playback"
 	"github.com/jukebox/backend/internal/store"
 	"github.com/jukebox/backend/internal/ws"
+	"github.com/jukebox/backend/internal/youtube"
 )
 
 func main() {
@@ -95,7 +96,13 @@ func main() {
 	authH := handlers.NewAuthHandler(pg, redis, emailSvc, cfg.JWTSecret, cfg.TurnstileSecretKey, signupLimiter)
 	msgH := handlers.NewMessageHandler(pg)
 	plH := handlers.NewPlaylistHandler(pg)
-	adminH := handlers.NewAdminHandler(pg, redis, hubMgr, syncSvc)
+	// YouTube search client is optional: nil when YOUTUBE_DATA_API_KEY is unset,
+	// which causes the admin bulk-search endpoint to return 503 with a clear message.
+	var ytClient *youtube.Client
+	if cfg.YouTubeDataAPIKey != "" {
+		ytClient = youtube.NewClient(cfg.YouTubeDataAPIKey)
+	}
+	adminH := handlers.NewAdminHandler(pg, redis, hubMgr, syncSvc, ytClient)
 	monH := handlers.NewMonetizationHandler(pg, hubMgr)
 	lkH := handlers.NewLiveKitHandler(cfg)
 
@@ -220,6 +227,10 @@ func main() {
 		r.Delete("/admin/autoplay/rooms/{id}/staged", adminH.DeleteStagedPlaylist)
 		r.Post("/admin/autoplay/rooms/{id}/start", adminH.StartAutoplayRoom)
 		r.Post("/admin/autoplay/rooms/{id}/stop", adminH.StopAutoplayRoom)
+
+		// Admin: resolve a free-form query to YouTube Data API top match + alternatives.
+		// Used by the /admin/autoplay Bulk mode to skip manual YouTube searches.
+		r.Get("/admin/search-track", adminH.SearchTrack)
 
 		// Featured room (public)
 		r.Get("/featured", adminH.GetFeatured)

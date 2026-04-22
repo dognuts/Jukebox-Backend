@@ -36,10 +36,10 @@ func TestIsDisposableEmail(t *testing.T) {
 
 		// Edge cases
 		{"user@", false, "missing domain"},
-		{"@mailinator.com", false, "missing local part still has domain"},
+		{"@mailinator.com", true, "empty local part but domain is disposable"},
 		{"noatsign", false, "no @ sign"},
 		{"", false, "empty string"},
-		{"user@MAILINATOR.COM", false, "uppercase not matched (domains are lowercased in check)"},
+		{"user@MAILINATOR.COM", true, "uppercase matched (domains are lowercased in check)"},
 	}
 
 	for _, tt := range tests {

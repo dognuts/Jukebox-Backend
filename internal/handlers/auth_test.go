@@ -1,6 +1,9 @@
 package handlers
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestValidatePassword(t *testing.T) {
 	tests := []struct {
@@ -13,7 +16,7 @@ func TestValidatePassword(t *testing.T) {
 		{"MyP4ssword", true, "uppercase, lowercase, digit"},
 		{"abcDEF123", true, "mixed case with digits"},
 		{"Aa1" + "xxxxx", true, "exactly 8 chars"},
-		{"Aa1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", true, "128 chars"},
+		{"Aa1" + strings.Repeat("x", 125), true, "128 chars (upper boundary)"},
 
 		// Too short
 		{"Pass1", false, "too short (5 chars)"},
