@@ -37,18 +37,23 @@ func requestWithUser(user *models.User, query string) *http.Request {
 	return r
 }
 
-func TestSearchTrack_RequiresAdmin(t *testing.T) {
+func TestSearchTrack_NoUserReturns401(t *testing.T) {
+	// No user in context = expired/missing JWT. Must be 401 (not 403) so the
+	// frontend knows to refresh the token and retry, rather than treating
+	// the user as "not admin" until the next scheduled refresh window.
 	h := newSearchHandler(&fakeSearcher{})
 	w := httptest.NewRecorder()
-
-	// No user at all
 	h.SearchTrack(w, requestWithUser(nil, "apache"))
-	if w.Code != http.StatusForbidden {
-		t.Errorf("no user: status = %d, want 403", w.Code)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("no user: status = %d, want 401", w.Code)
 	}
+}
 
-	// Logged-in but non-admin
-	w = httptest.NewRecorder()
+func TestSearchTrack_NonAdminReturns403(t *testing.T) {
+	// Authenticated but not admin = legitimate 403. Refresh won't help; the
+	// account doesn't have access.
+	h := newSearchHandler(&fakeSearcher{})
+	w := httptest.NewRecorder()
 	h.SearchTrack(w, requestWithUser(&models.User{IsAdmin: false}, "apache"))
 	if w.Code != http.StatusForbidden {
 		t.Errorf("non-admin: status = %d, want 403", w.Code)

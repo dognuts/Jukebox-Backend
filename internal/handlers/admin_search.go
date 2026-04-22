@@ -21,8 +21,7 @@ const maxSearchQueryLen = 200
 // SearchTrack handles GET /api/admin/search-track?q=<query>.
 // Returns the YouTube Data API top match plus up to 4 alternatives.
 func (h *AdminHandler) SearchTrack(w http.ResponseWriter, r *http.Request) {
-	if h.requireAdmin(r) == nil {
-		http.Error(w, "admin required", http.StatusForbidden)
+	if h.requireAdmin(w, r) == nil {
 		return
 	}
 	if h.yt == nil {

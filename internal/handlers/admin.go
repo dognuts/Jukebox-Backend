@@ -39,10 +39,24 @@ func NewAdminHandler(pg *store.PGStore, redis *store.RedisStore, hubs *ws.HubMan
 	return h
 }
 
-// requireAdmin checks that the requesting user is an admin.
-func (h *AdminHandler) requireAdmin(r *http.Request) *models.User {
+// requireAdmin checks that the requester is authenticated AND admin. It writes
+// 401 (no user — typically an expired or missing JWT) or 403 (authenticated
+// but not admin) directly and returns nil in those cases, so the caller just
+// does `if h.requireAdmin(w, r) == nil { return }`.
+//
+// Distinguishing 401 from 403 matters for the frontend: 401 signals "refresh
+// your token and retry," while 403 means "your account doesn't have access."
+// Conflating them into 403 left expired-token users looking like non-admins
+// until their next scheduled refresh window, which was the cause of the save
+// failures seen after a Render restart on 2026-04-22.
+func (h *AdminHandler) requireAdmin(w http.ResponseWriter, r *http.Request) *models.User {
 	user := middleware.GetUser(r.Context())
-	if user == nil || !user.IsAdmin {
+	if user == nil {
+		http.Error(w, "authentication required", http.StatusUnauthorized)
+		return nil
+	}
+	if !user.IsAdmin {
+		http.Error(w, "admin required", http.StatusForbidden)
 		return nil
 	}
 	return user
@@ -50,8 +64,7 @@ func (h *AdminHandler) requireAdmin(r *http.Request) *models.User {
 
 // GET /api/admin/rooms — list all rooms with full details
 func (h *AdminHandler) ListRooms(w http.ResponseWriter, r *http.Request) {
-	if h.requireAdmin(r) == nil {
-		http.Error(w, "admin required", http.StatusForbidden)
+	if h.requireAdmin(w, r) == nil {
 		return
 	}
 	ctx := r.Context()
@@ -73,9 +86,8 @@ func (h *AdminHandler) ListRooms(w http.ResponseWriter, r *http.Request) {
 
 // POST /api/admin/rooms — create an official room
 func (h *AdminHandler) CreateOfficialRoom(w http.ResponseWriter, r *http.Request) {
-	user := h.requireAdmin(r)
+	user := h.requireAdmin(w, r)
 	if user == nil {
-		http.Error(w, "admin required", http.StatusForbidden)
 		return
 	}
 
@@ -171,8 +183,7 @@ func (h *AdminHandler) CreateOfficialRoom(w http.ResponseWriter, r *http.Request
 
 // POST /api/admin/rooms/{id}/shutdown — force-close any room
 func (h *AdminHandler) ShutdownRoom(w http.ResponseWriter, r *http.Request) {
-	if h.requireAdmin(r) == nil {
-		http.Error(w, "admin required", http.StatusForbidden)
+	if h.requireAdmin(w, r) == nil {
 		return
 	}
 	roomID := chi.URLParam(r, "id")
@@ -202,8 +213,7 @@ func (h *AdminHandler) ShutdownRoom(w http.ResponseWriter, r *http.Request) {
 
 // DELETE /api/admin/rooms/{id} — permanently delete a room
 func (h *AdminHandler) DeleteRoom(w http.ResponseWriter, r *http.Request) {
-	if h.requireAdmin(r) == nil {
-		http.Error(w, "admin required", http.StatusForbidden)
+	if h.requireAdmin(w, r) == nil {
 		return
 	}
 	roomID := chi.URLParam(r, "id")
@@ -242,8 +252,7 @@ func (h *AdminHandler) DeleteRoom(w http.ResponseWriter, r *http.Request) {
 
 // POST /api/admin/rooms/{id}/feature — set room as featured
 func (h *AdminHandler) SetFeatured(w http.ResponseWriter, r *http.Request) {
-	if h.requireAdmin(r) == nil {
-		http.Error(w, "admin required", http.StatusForbidden)
+	if h.requireAdmin(w, r) == nil {
 		return
 	}
 	roomID := chi.URLParam(r, "id")
@@ -261,8 +270,7 @@ func (h *AdminHandler) SetFeatured(w http.ResponseWriter, r *http.Request) {
 
 // POST /api/admin/rooms/{id}/official — toggle official status
 func (h *AdminHandler) SetOfficial(w http.ResponseWriter, r *http.Request) {
-	if h.requireAdmin(r) == nil {
-		http.Error(w, "admin required", http.StatusForbidden)
+	if h.requireAdmin(w, r) == nil {
 		return
 	}
 	roomID := chi.URLParam(r, "id")
@@ -280,8 +288,7 @@ func (h *AdminHandler) SetOfficial(w http.ResponseWriter, r *http.Request) {
 
 // PATCH /api/admin/rooms/{id} — update room settings (expiry, cover art, etc)
 func (h *AdminHandler) UpdateRoom(w http.ResponseWriter, r *http.Request) {
-	if h.requireAdmin(r) == nil {
-		http.Error(w, "admin required", http.StatusForbidden)
+	if h.requireAdmin(w, r) == nil {
 		return
 	}
 	roomID := chi.URLParam(r, "id")
@@ -365,8 +372,7 @@ func (h *AdminHandler) GetFeatured(w http.ResponseWriter, r *http.Request) {
 
 // GET /api/admin/users — list all users with optional search
 func (h *AdminHandler) ListUsers(w http.ResponseWriter, r *http.Request) {
-	if h.requireAdmin(r) == nil {
-		http.Error(w, "admin required", http.StatusForbidden)
+	if h.requireAdmin(w, r) == nil {
 		return
 	}
 	query := r.URL.Query().Get("q")
@@ -381,8 +387,7 @@ func (h *AdminHandler) ListUsers(w http.ResponseWriter, r *http.Request) {
 
 // GET /api/admin/users/{id} — get full user details
 func (h *AdminHandler) GetUser(w http.ResponseWriter, r *http.Request) {
-	if h.requireAdmin(r) == nil {
-		http.Error(w, "admin required", http.StatusForbidden)
+	if h.requireAdmin(w, r) == nil {
 		return
 	}
 	userID := chi.URLParam(r, "id")
@@ -396,8 +401,7 @@ func (h *AdminHandler) GetUser(w http.ResponseWriter, r *http.Request) {
 
 // PATCH /api/admin/users/{id} — update user fields (ban, verify, set admin, reset neon, etc.)
 func (h *AdminHandler) UpdateUser(w http.ResponseWriter, r *http.Request) {
-	if h.requireAdmin(r) == nil {
-		http.Error(w, "admin required", http.StatusForbidden)
+	if h.requireAdmin(w, r) == nil {
 		return
 	}
 	userID := chi.URLParam(r, "id")
@@ -445,8 +449,7 @@ func (h *AdminHandler) UpdateUser(w http.ResponseWriter, r *http.Request) {
 
 // DELETE /api/admin/users/{id} — delete a user account
 func (h *AdminHandler) DeleteUser(w http.ResponseWriter, r *http.Request) {
-	if h.requireAdmin(r) == nil {
-		http.Error(w, "admin required", http.StatusForbidden)
+	if h.requireAdmin(w, r) == nil {
 		return
 	}
 	userID := chi.URLParam(r, "id")
@@ -462,8 +465,7 @@ func (h *AdminHandler) DeleteUser(w http.ResponseWriter, r *http.Request) {
 
 // POST /api/admin/autoplay/rooms — create a new autoplay room
 func (h *AdminHandler) CreateAutoplayRoom(w http.ResponseWriter, r *http.Request) {
-	if h.requireAdmin(r) == nil {
-		http.Error(w, "admin required", http.StatusForbidden)
+	if h.requireAdmin(w, r) == nil {
 		return
 	}
 	var req struct {
@@ -506,8 +508,7 @@ func (h *AdminHandler) CreateAutoplayRoom(w http.ResponseWriter, r *http.Request
 
 // GET /api/admin/autoplay/rooms/{id}/playlists — get live and staged playlists
 func (h *AdminHandler) GetAutoplayPlaylists(w http.ResponseWriter, r *http.Request) {
-	if h.requireAdmin(r) == nil {
-		http.Error(w, "admin required", http.StatusForbidden)
+	if h.requireAdmin(w, r) == nil {
 		return
 	}
 	roomID := chi.URLParam(r, "id")
@@ -524,8 +525,7 @@ func (h *AdminHandler) GetAutoplayPlaylists(w http.ResponseWriter, r *http.Reque
 
 // PUT /api/admin/autoplay/rooms/{id}/staged — save the staged (next) playlist
 func (h *AdminHandler) SaveStagedPlaylist(w http.ResponseWriter, r *http.Request) {
-	if h.requireAdmin(r) == nil {
-		http.Error(w, "admin required", http.StatusForbidden)
+	if h.requireAdmin(w, r) == nil {
 		return
 	}
 	roomID := chi.URLParam(r, "id")
@@ -562,8 +562,7 @@ func (h *AdminHandler) SaveStagedPlaylist(w http.ResponseWriter, r *http.Request
 // tracks row is patched and a track_info_updated WS event is broadcast so
 // listeners see it immediately.
 func (h *AdminHandler) UpdateLiveSnippets(w http.ResponseWriter, r *http.Request) {
-	if h.requireAdmin(r) == nil {
-		http.Error(w, "admin required", http.StatusForbidden)
+	if h.requireAdmin(w, r) == nil {
 		return
 	}
 	roomID := chi.URLParam(r, "id")
@@ -640,8 +639,7 @@ func (h *AdminHandler) UpdateLiveSnippets(w http.ResponseWriter, r *http.Request
 //     finishes and the next advance picks whatever lives there now.
 //   - If the new list is empty, we 400 — admins should use Stop instead.
 func (h *AdminHandler) UpdateLiveTracks(w http.ResponseWriter, r *http.Request) {
-	if h.requireAdmin(r) == nil {
-		http.Error(w, "admin required", http.StatusForbidden)
+	if h.requireAdmin(w, r) == nil {
 		return
 	}
 	roomID := chi.URLParam(r, "id")
@@ -743,8 +741,7 @@ func parseAutoplayTrackIndex(trackID string) (int, bool) {
 
 // POST /api/admin/autoplay/rooms/{id}/activate — promote staged to live
 func (h *AdminHandler) ActivatePlaylist(w http.ResponseWriter, r *http.Request) {
-	if h.requireAdmin(r) == nil {
-		http.Error(w, "admin required", http.StatusForbidden)
+	if h.requireAdmin(w, r) == nil {
 		return
 	}
 	roomID := chi.URLParam(r, "id")
@@ -768,8 +765,7 @@ func (h *AdminHandler) ActivatePlaylist(w http.ResponseWriter, r *http.Request) 
 
 // DELETE /api/admin/autoplay/rooms/{id}/staged — delete the staged playlist
 func (h *AdminHandler) DeleteStagedPlaylist(w http.ResponseWriter, r *http.Request) {
-	if h.requireAdmin(r) == nil {
-		http.Error(w, "admin required", http.StatusForbidden)
+	if h.requireAdmin(w, r) == nil {
 		return
 	}
 	roomID := chi.URLParam(r, "id")
@@ -781,8 +777,7 @@ func (h *AdminHandler) DeleteStagedPlaylist(w http.ResponseWriter, r *http.Reque
 // room using its existing live playlist. No-op (with 200) if the room is
 // already running.
 func (h *AdminHandler) StartAutoplayRoom(w http.ResponseWriter, r *http.Request) {
-	if h.requireAdmin(r) == nil {
-		http.Error(w, "admin required", http.StatusForbidden)
+	if h.requireAdmin(w, r) == nil {
 		return
 	}
 	roomID := chi.URLParam(r, "id")
@@ -811,8 +806,7 @@ func (h *AdminHandler) StartAutoplayRoom(w http.ResponseWriter, r *http.Request)
 
 // POST /api/admin/autoplay/rooms/{id}/stop — stop an autoplay room
 func (h *AdminHandler) StopAutoplayRoom(w http.ResponseWriter, r *http.Request) {
-	if h.requireAdmin(r) == nil {
-		http.Error(w, "admin required", http.StatusForbidden)
+	if h.requireAdmin(w, r) == nil {
 		return
 	}
 	roomID := chi.URLParam(r, "id")
@@ -828,8 +822,7 @@ func (h *AdminHandler) StopAutoplayRoom(w http.ResponseWriter, r *http.Request) 
 
 // GET /api/admin/metrics — dashboard metrics
 func (h *AdminHandler) GetMetrics(w http.ResponseWriter, r *http.Request) {
-	if h.requireAdmin(r) == nil {
-		http.Error(w, "admin required", http.StatusForbidden)
+	if h.requireAdmin(w, r) == nil {
 		return
 	}
 	ctx := r.Context()
