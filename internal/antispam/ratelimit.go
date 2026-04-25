@@ -30,6 +30,13 @@ func (rl *RateLimiter) AllowLogin(ctx context.Context, ip string) (bool, error) 
 	return rl.checkRate(ctx, "login_rate:"+ip, int64(rl.maxPerHour*2))
 }
 
+// AllowSupportReport returns true if the IP has not exceeded the
+// listener-support-report rate limit (maxPerHour, same as signup).
+// Uses the same fixed-window Redis INCR+EXPIRE approach as the other limiters.
+func (rl *RateLimiter) AllowSupportReport(ctx context.Context, ip string) (bool, error) {
+	return rl.checkRate(ctx, "support_report_rate:"+ip, int64(rl.maxPerHour))
+}
+
 func (rl *RateLimiter) checkRate(ctx context.Context, key string, max int64) (bool, error) {
 	if key == "" {
 		return true, nil
