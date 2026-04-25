@@ -104,6 +104,7 @@ func main() {
 	}
 	adminH := handlers.NewAdminHandler(pg, redis, hubMgr, syncSvc, ytClient)
 	monH := handlers.NewMonetizationHandler(pg, hubMgr)
+	supportH := handlers.NewSupportHandler(pg, signupLimiter, emailSvc)
 	lkH := handlers.NewLiveKitHandler(cfg)
 
 	// ---------- Router ----------
@@ -250,6 +251,9 @@ func main() {
 		r.Post("/billing/neon/send", monH.SendNeon)
 		r.Get("/rooms/{roomId}/tube", monH.GetTubeState)
 		r.Post("/admin/pool/compute", monH.ComputePool)
+
+		// Support / listener reports (public — anonymous listeners can submit)
+		r.Post("/support/listener-report", supportH.CreateListenerReport)
 
 		// LiveKit voice
 		r.Post("/livekit/token", lkH.GetToken)
