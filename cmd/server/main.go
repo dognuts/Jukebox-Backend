@@ -78,7 +78,7 @@ func main() {
 	syncSvc := playback.NewSyncService(pg, redis, hubMgr)
 	idleMon := playback.NewIdleMonitor(pg, redis, hubMgr)
 	idleMon.Start()
-	emailSvc := email.NewService(cfg.ResendAPIKey, cfg.FromEmail, cfg.FrontendURL)
+	emailSvc := email.NewService(cfg.ResendAPIKey, cfg.FromEmail, cfg.FrontendURL, cfg.AdminEmail)
 
 	// Boot autoplay rooms
 	syncSvc.StartAutoplayRooms(cleanupCtx)
