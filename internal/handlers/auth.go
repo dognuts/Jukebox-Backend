@@ -56,16 +56,7 @@ func (h *AuthHandler) Signup(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// --- Anti-spam: rate limiting ---
-	ip := r.Header.Get("X-Forwarded-For")
-	if ip == "" {
-		ip = r.Header.Get("X-Real-IP")
-	}
-	if ip == "" {
-		ip = strings.Split(r.RemoteAddr, ":")[0]
-	}
-	if idx := strings.Index(ip, ","); idx != -1 {
-		ip = strings.TrimSpace(ip[:idx])
-	}
+	ip := ClientIP(r)
 	if h.signupRateLimiter != nil {
 		allowed, err := h.signupRateLimiter.AllowSignup(r.Context(), ip)
 		if err != nil {
@@ -177,17 +168,7 @@ func (h *AuthHandler) Signup(w http.ResponseWriter, r *http.Request) {
 
 	// Geolocate from IP (non-blocking — don't fail signup if this errors)
 	go func() {
-		ip := r.Header.Get("X-Forwarded-For")
-		if ip == "" {
-			ip = r.Header.Get("X-Real-IP")
-		}
-		if ip == "" {
-			ip = strings.Split(r.RemoteAddr, ":")[0]
-		}
-		// Strip multiple IPs (take first)
-		if idx := strings.Index(ip, ","); idx != -1 {
-			ip = strings.TrimSpace(ip[:idx])
-		}
+		ip := ClientIP(r)
 		if ip == "" || ip == "127.0.0.1" || ip == "::1" || ip == "[" {
 			return
 		}
@@ -277,16 +258,7 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// --- Anti-spam: rate limit login attempts ---
-	ip := r.Header.Get("X-Forwarded-For")
-	if ip == "" {
-		ip = r.Header.Get("X-Real-IP")
-	}
-	if ip == "" {
-		ip = strings.Split(r.RemoteAddr, ":")[0]
-	}
-	if idx := strings.Index(ip, ","); idx != -1 {
-		ip = strings.TrimSpace(ip[:idx])
-	}
+	ip := ClientIP(r)
 	if h.signupRateLimiter != nil {
 		allowed, err := h.signupRateLimiter.AllowLogin(r.Context(), ip)
 		if err != nil {
