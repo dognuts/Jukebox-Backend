@@ -251,6 +251,8 @@ func TestGetApprovedQueueCounts(t *testing.T) {
 // TestUpsertAutoplayTrackRefreshesMetadata proves stable-ID reuse: replaying
 // the same (room, URL) updates the existing row in place — no new rows — and
 // a duration learned from a client report survives a playlist that says 0.
+// The learned value is also written back into the passed track, so the
+// caller's broadcast and advance timer see it (not the 600s fallback).
 func TestUpsertAutoplayTrackRefreshesMetadata(t *testing.T) {
 	s := newBatchTestDB(t)
 	ctx := context.Background()
@@ -289,6 +291,9 @@ func TestUpsertAutoplayTrackRefreshesMetadata(t *testing.T) {
 	}
 	if n := countTracks(); n != 1 {
 		t.Fatalf("tracks rows after replay = %d, want 1 (stable ID must dedupe)", n)
+	}
+	if tr2.Duration != 240 {
+		t.Errorf("tr2.Duration = %d after upsert, want 240 (learned duration written back for the advance timer)", tr2.Duration)
 	}
 
 	got, err := s.GetTrack(ctx, tr.ID)

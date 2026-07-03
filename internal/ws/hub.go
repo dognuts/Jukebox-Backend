@@ -91,8 +91,20 @@ type Hub struct {
 	// clients, none pending" check, and RegisterClient refuses once it is
 	// set — so a fresh client can never register into the window between
 	// that check and close(quit) and get torn down by a hub it just joined.
+	// The Run loop re-checks stopping when it receives a registration, so
+	// even a client already in flight when a stop path (DJ left, room
+	// ended) commits is refused rather than added to a dying hub.
 	stopping    bool
 	pendingRegs int
+
+	// countMu serializes each presence mutation (AddListener /
+	// RemoveListener) with the enqueue of its listener_count broadcast.
+	// The per-client onRegister/onUnregister goroutines run concurrently;
+	// without this lock two joins could read counts 1 and 2 from Redis but
+	// enqueue "2" before "1", leaving every client displaying the stale
+	// count until the next churn. Broadcast fanout is FIFO, so making
+	// (mutate, enqueue) atomic makes counts arrive in order.
+	countMu sync.Mutex
 
 	// persistCh feeds persistLoop, which inserts chat messages into
 	// Postgres in FIFO order after they have been broadcast.
@@ -136,6 +148,20 @@ func (h *Hub) Run() {
 		select {
 		case client := <-h.Register:
 			h.mu.Lock()
+			if h.stopping {
+				// The hub committed to stopping (DJ left, room ended)
+				// after this client passed RegisterClient's check but
+				// before the loop received it. Refuse deterministically:
+				// never add it to Clients, release its ordering barrier
+				// (nothing will run onRegister, so onUnregister must not
+				// wait on it), and close it so its pumps exit and the
+				// client reconnects onto a fresh hub.
+				h.pendingRegs--
+				h.mu.Unlock()
+				close(client.registered)
+				client.close()
+				continue
+			}
 			h.Clients[client] = true
 			h.pendingRegs--
 			h.mu.Unlock()
@@ -280,9 +306,10 @@ func (h *Hub) onRegister(client *Client) {
 
 	ctx := context.Background()
 
-	// Update listener count
-	count, _ := h.redis.AddListener(ctx, h.RoomID, client.Session.ID)
-	h.broadcastListenerCount(int(count))
+	// Update listener count (mutation and broadcast are atomic — see countMu).
+	h.updateListenerCount(func() (int64, error) {
+		return h.redis.AddListener(ctx, h.RoomID, client.Session.ID)
+	})
 
 	// Broadcast join activity
 	h.broadcastJSON(WSMessage{Event: "listener_join", Payload: map[string]string{
@@ -324,8 +351,9 @@ func (h *Hub) onUnregister(client *Client) {
 	<-client.registered
 
 	ctx := context.Background()
-	count, _ := h.redis.RemoveListener(ctx, h.RoomID, client.Session.ID)
-	h.broadcastListenerCount(int(count))
+	h.updateListenerCount(func() (int64, error) {
+		return h.redis.RemoveListener(ctx, h.RoomID, client.Session.ID)
+	})
 
 	// Broadcast leave activity
 	h.broadcastJSON(WSMessage{Event: "listener_leave", Payload: map[string]string{
@@ -400,6 +428,9 @@ func (h *Hub) stop() {
 	h.stopOnce.Do(func() {
 		// Mark stopping first so RegisterClient refuses new clients even
 		// on stop paths (DJ left, room ended) that didn't already set it.
+		// A registration already in flight past RegisterClient's check is
+		// covered too: the Run loop re-checks stopping on receive and
+		// rejects it (see the Register case in Run).
 		h.mu.Lock()
 		h.stopping = true
 		h.mu.Unlock()
@@ -414,6 +445,11 @@ func (h *Hub) stop() {
 // the hub has shut down or committed to shutting down (a race with the
 // room ending); the caller should drop the connection and let the client
 // reconnect onto a fresh hub.
+//
+// If a stop path commits while the registration is already in flight, this
+// can still return true — the Run loop then refuses the client (stopping
+// re-check) and closes it, so its pumps exit immediately and the caller-side
+// outcome is identical: dropped connection, clean reconnect.
 func (h *Hub) RegisterClient(c *Client) bool {
 	// Claim a pending-registration slot under mu: the idle-shutdown check
 	// in onUnregister counts pendingRegs and sets stopping under the same
@@ -1042,6 +1078,17 @@ func (h *Hub) enqueueBroadcast(data []byte) {
 	default:
 		log.Printf("[ws] room %s: broadcast buffer full, dropping message", h.RoomSlug)
 	}
+}
+
+// updateListenerCount runs one presence mutation (AddListener or
+// RemoveListener) and enqueues its listener_count broadcast as an atomic
+// pair under countMu, so counts reach clients in mutation order and a stale
+// count can never overwrite a newer one.
+func (h *Hub) updateListenerCount(mutate func() (int64, error)) {
+	h.countMu.Lock()
+	defer h.countMu.Unlock()
+	count, _ := mutate()
+	h.broadcastListenerCount(int(count))
 }
 
 func (h *Hub) broadcastListenerCount(count int) {

@@ -165,9 +165,11 @@ func (s *PGStore) GetNextAutoplayTrack(ctx context.Context, roomID string) (*mod
 // stable across advances (see playback's autoplayTrackID), so playlist edits
 // — retitles, snippet changes, corrected durations — must land on the
 // existing row when the track comes around again. A duration learned from a
-// client report (UpdateTrackDuration) is kept when the playlist still says 0.
+// client report (UpdateTrackDuration) is kept when the playlist still says 0,
+// and RETURNING writes the row's effective duration back into t.Duration so
+// the caller's broadcast and advance timer use the learned value too.
 func (s *PGStore) UpsertAutoplayTrack(ctx context.Context, t *models.Track) error {
-	_, err := s.pool.Exec(ctx, `
+	return s.pool.QueryRow(ctx, `
 		INSERT INTO tracks (id, title, artist, duration, source, source_url, album_gradient, info_snippet, created_at)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
 		ON CONFLICT (id) DO UPDATE SET
@@ -177,10 +179,10 @@ func (s *PGStore) UpsertAutoplayTrack(ctx context.Context, t *models.Track) erro
 			source = EXCLUDED.source,
 			source_url = EXCLUDED.source_url,
 			album_gradient = EXCLUDED.album_gradient,
-			info_snippet = EXCLUDED.info_snippet`,
+			info_snippet = EXCLUDED.info_snippet
+		RETURNING duration`,
 		t.ID, t.Title, t.Artist, t.Duration, t.Source, t.SourceURL, t.AlbumGradient, t.InfoSnippet, t.CreatedAt,
-	)
-	return err
+	).Scan(&t.Duration)
 }
 
 // GetAutoplayRooms returns all rooms with is_autoplay = true.

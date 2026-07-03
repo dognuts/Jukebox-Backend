@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand"
 	"time"
@@ -231,18 +232,25 @@ func (r *RedisStore) GetListenerCounts(ctx context.Context, roomIDs []string) ma
 }
 
 // GetPlaybackStates pipelines GET for many rooms into one round-trip.
-// Returns a map roomID -> *PlaybackState (nil entries omitted).
-func (r *RedisStore) GetPlaybackStates(ctx context.Context, roomIDs []string) map[string]*models.PlaybackState {
+// Returns a map roomID -> *PlaybackState (nil entries omitted). A pipeline
+// error (Redis down, timeout) is surfaced rather than silently returning an
+// empty map: to the idle monitor "no playback state anywhere" and "Redis is
+// unreachable" must be distinguishable, or an outage longer than the idle
+// timeout would auto-close every live room with an empty queue.
+func (r *RedisStore) GetPlaybackStates(ctx context.Context, roomIDs []string) (map[string]*models.PlaybackState, error) {
 	out := make(map[string]*models.PlaybackState, len(roomIDs))
 	if len(roomIDs) == 0 {
-		return out
+		return out, nil
 	}
 	pipe := r.client.Pipeline()
 	cmds := make([]*redis.StringCmd, len(roomIDs))
 	for i, id := range roomIDs {
 		cmds[i] = pipe.Get(ctx, "playback:"+id)
 	}
-	_, _ = pipe.Exec(ctx)
+	// redis.Nil just means some room has no playback state — not a failure.
+	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		return nil, err
+	}
 	for i, id := range roomIDs {
 		data, err := cmds[i].Result()
 		if err != nil || data == "" {
@@ -253,7 +261,7 @@ func (r *RedisStore) GetPlaybackStates(ctx context.Context, roomIDs []string) ma
 			out[id] = &ps
 		}
 	}
-	return out
+	return out, nil
 }
 
 func (r *RedisStore) ClearListeners(ctx context.Context, roomID string) error {

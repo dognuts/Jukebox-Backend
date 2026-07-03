@@ -2,15 +2,18 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jukebox/backend/internal/models"
 )
@@ -45,6 +48,34 @@ func TestListUpMigrations(t *testing.T) {
 	}
 	if !found013 {
 		t.Error("013_chat_media.up.sql not discovered — chat media columns would never be created")
+	}
+}
+
+// TestIsAlreadyAppliedError: legacy already-applied migrations must be
+// classified by SQLSTATE code, never by message text — Postgres localizes
+// error messages under non-English lc_messages, where "already exists"
+// never appears.
+func TestIsAlreadyAppliedError(t *testing.T) {
+	byCode := func(code string) error {
+		// A localized server message: string matching would misclassify it.
+		return fmt.Errorf("exec: %w", &pgconn.PgError{Code: code, Message: "die Tabelle existiert bereits"})
+	}
+	for _, code := range []string{"42P07", "42701", "42710", "23505"} {
+		if !isAlreadyAppliedError(byCode(code)) {
+			t.Errorf("SQLSTATE %s: want already-applied, got not", code)
+		}
+	}
+	// Other SQLSTATEs (e.g. syntax error) are real failures.
+	if isAlreadyAppliedError(byCode("42601")) {
+		t.Error("SQLSTATE 42601 (syntax_error) misclassified as already applied")
+	}
+	// A non-Postgres error whose text happens to contain the English words
+	// must not match: classification is by code, not message.
+	if isAlreadyAppliedError(errors.New(`ERROR: relation "rooms" already exists`)) {
+		t.Error("plain error with 'already exists' text misclassified as already applied")
+	}
+	if isAlreadyAppliedError(nil) {
+		t.Error("nil error misclassified as already applied")
 	}
 }
 
@@ -189,6 +220,43 @@ func TestRunMigrationsFreshDB(t *testing.T) {
 	if after := countAppliedMigrations(t, s); after != before {
 		t.Errorf("second run changed schema_migrations rows: %d -> %d", before, after)
 	}
+}
+
+// TestRunMigrationsConcurrent: two server replicas booting simultaneously
+// must not race — without the advisory lock both see every migration
+// unapplied, and the loser's schema_migrations INSERT fails with a
+// duplicate-key error. With the lock, one run migrates and the other finds
+// everything recorded.
+func TestRunMigrationsConcurrent(t *testing.T) {
+	s := newMigrationTestDB(t)
+	ctx := context.Background()
+
+	const replicas = 3
+	errs := make([]error, replicas)
+	var wg sync.WaitGroup
+	for i := 0; i < replicas; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs[i] = s.RunMigrations(ctx, testMigrationsDir)
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("concurrent RunMigrations #%d: %v", i, err)
+		}
+	}
+
+	files, err := listUpMigrations(testMigrationsDir)
+	if err != nil {
+		t.Fatalf("listUpMigrations: %v", err)
+	}
+	if n := countAppliedMigrations(t, s); n != len(files) {
+		t.Errorf("schema_migrations has %d rows, want %d", n, len(files))
+	}
+	assertChatWithMediaWorks(t, s)
 }
 
 // TestRunMigrationsLegacyDB reproduces a production database migrated by the

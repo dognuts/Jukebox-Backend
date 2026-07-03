@@ -215,7 +215,11 @@ func (s *SyncService) advanceAutoplay(ctx context.Context, roomID string, hub *w
 
 	// Find-or-refresh the synthetic tracks row so the GetNowPlaying JOIN
 	// resolves. The stable ID means replays reuse the same row (with metadata
-	// refreshed) instead of growing the tracks table on every advance.
+	// refreshed) instead of growing the tracks table on every advance. On
+	// success the upsert also writes the row's effective duration back into
+	// track.Duration: when the playlist says 0 but a listener already
+	// reported the real length (UpdateTrackDuration), the broadcast below and
+	// the advance timer use the learned value instead of the 600s fallback.
 	if err := s.pg.UpsertAutoplayTrack(ctx, track); err != nil {
 		log.Printf("[autoplay] room %s: failed to upsert track: %v", roomID, err)
 	}

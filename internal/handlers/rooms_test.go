@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -138,7 +139,9 @@ func TestSessionPlaylistTrackIDs(t *testing.T) {
 // TestSetPublicCache: a plain response gets the shared-cache header, but if
 // SessionMiddleware already minted a session cookie (first-time visitor), the
 // response is personalized and must be no-store — a shared cache storing that
-// Set-Cookie would hand one visitor's session to everyone else.
+// Set-Cookie would hand one visitor's session to everyone else. Applies to
+// the rooms LIST endpoint only; the detail endpoint sends no Cache-Control at
+// all so state transitions are never served stale (see RoomHandler.Get).
 func TestSetPublicCache(t *testing.T) {
 	t.Run("no cookie: publicly cacheable", func(t *testing.T) {
 		w := httptest.NewRecorder()
@@ -246,6 +249,50 @@ func TestPayloadCacheKeysAreIndependent(t *testing.T) {
 	b, _ := c.getOrBuild("b", func() ([]byte, error) { return []byte("B"), nil })
 	if string(a) != "A" || string(b) != "B" {
 		t.Errorf("got a=%q b=%q, want A and B", a, b)
+	}
+}
+
+// TestPayloadCacheKeyLengthCap: keys longer than maxPayloadCacheKeyLen embed
+// attacker-controlled query params (the genre filter), so they must bypass
+// the cache entirely — built per request, never stored — or 256 junk genres
+// within one TTL window would evict the hot homepage entry while pinning
+// arbitrarily large key strings in memory.
+func TestPayloadCacheKeyLengthCap(t *testing.T) {
+	c := newPayloadCache(time.Minute)
+	var builds int32
+	build := func() ([]byte, error) {
+		atomic.AddInt32(&builds, 1)
+		return []byte("payload"), nil
+	}
+
+	longKey := strings.Repeat("g", maxPayloadCacheKeyLen+1)
+	for i := 0; i < 3; i++ {
+		data, err := c.getOrBuild(longKey, build)
+		if err != nil || string(data) != "payload" {
+			t.Fatalf("getOrBuild(long key): got (%q, %v), want (payload, nil)", data, err)
+		}
+	}
+	if n := atomic.LoadInt32(&builds); n != 3 {
+		t.Errorf("build ran %d times for an oversized key, want 3 (never cached)", n)
+	}
+	c.mu.Lock()
+	entries := len(c.entries)
+	c.mu.Unlock()
+	if entries != 0 {
+		t.Errorf("cache holds %d entries after oversized-key requests, want 0", entries)
+	}
+
+	// A key at exactly the cap is still cached — the cap must not shrink
+	// legitimate genre filters' hit rate.
+	atomic.StoreInt32(&builds, 0)
+	edgeKey := strings.Repeat("g", maxPayloadCacheKeyLen)
+	for i := 0; i < 3; i++ {
+		if _, err := c.getOrBuild(edgeKey, build); err != nil {
+			t.Fatalf("getOrBuild(edge key): %v", err)
+		}
+	}
+	if n := atomic.LoadInt32(&builds); n != 1 {
+		t.Errorf("build ran %d times for a cap-length key, want 1 (cached)", n)
 	}
 }
 

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jukebox/backend/internal/models"
 )
@@ -68,21 +70,77 @@ func (s *PGStore) ResetAllRoomsOffline(ctx context.Context) error {
 // legacyMigrationCutoff marks the transition to schema_migrations bookkeeping.
 // Migrations sorting before this prefix (001–012) shipped before the
 // bookkeeping table existed, so on older databases they may already be applied
-// without being recorded. Only those files tolerate "already exists" errors on
-// re-run; every migration from 013 onward runs strictly and fails loudly.
+// without being recorded. Only those files tolerate duplicate-object errors
+// (see isAlreadyAppliedError) on re-run; every migration from 013 onward runs
+// strictly and fails loudly.
 // This set is closed — it can never grow, so do not raise the cutoff.
 const legacyMigrationCutoff = "013"
 
+// migrationLockKey is the well-known pg_advisory_lock key that serializes
+// RunMigrations across server replicas sharing one database. The value is
+// arbitrary but must never change: 0x6a756b65626f7801 is "jukebox\x01".
+const migrationLockKey = int64(0x6a756b65626f7801)
+
+// isAlreadyAppliedError reports whether err is Postgres telling us the
+// migration's objects already exist. Matched by SQLSTATE code — never by
+// message text, which is localized under non-English lc_messages:
+//
+//	42P07 duplicate_table, 42701 duplicate_column,
+//	42710 duplicate_object, 23505 unique_violation
+func isAlreadyAppliedError(err error) bool {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+	switch pgErr.Code {
+	case "42P07", "42701", "42710", "23505":
+		return true
+	}
+	return false
+}
+
 // RunMigrations executes every *.up.sql file in migrationsDir in lexicographic
 // order, recording applied files in a schema_migrations table so each
-// migration runs exactly once.
+// migration runs exactly once. The whole run holds a session-scoped advisory
+// lock, so two replicas booting simultaneously apply each migration once
+// instead of racing on the schema_migrations inserts.
 //
 // Databases migrated before schema_migrations existed are handled per file:
-// each file executes as a single implicit transaction, so on an
-// already-migrated database a pre-cutoff file fails atomically with
-// "already exists", leaves the schema untouched, and is recorded as applied.
+// each file executes inside one explicit transaction, so on an
+// already-migrated database a pre-cutoff file fails atomically with a
+// duplicate-object error, leaves the schema untouched, and is recorded as
+// applied.
 func (s *PGStore) RunMigrations(ctx context.Context, migrationsDir string) error {
-	if _, err := s.pool.Exec(ctx, `
+	// The advisory lock is session-scoped, so it must be taken and released
+	// on one dedicated connection — pool.Exec could run the lock and unlock
+	// on different sessions.
+	lockConn, err := s.pool.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire migration lock connection: %w", err)
+	}
+	defer lockConn.Release()
+	// The lock wait may legitimately outlast the pool-wide statement_timeout
+	// (sized for individual queries) while another replica migrates; exempt
+	// this session so a slow-but-healthy migration doesn't crash its peers.
+	// Session-scoped, and the session is released/closed right after the run.
+	if _, err := lockConn.Exec(ctx, `SET statement_timeout = 0`); err != nil {
+		return fmt.Errorf("exempt migration lock from statement_timeout: %w", err)
+	}
+	if _, err := lockConn.Exec(ctx, `SELECT pg_advisory_lock($1)`, migrationLockKey); err != nil {
+		return fmt.Errorf("acquire migration lock: %w", err)
+	}
+	defer func() {
+		// Unlock on a fresh context so a canceled ctx can't strand the lock.
+		unlockCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := lockConn.Exec(unlockCtx, `SELECT pg_advisory_unlock($1)`, migrationLockKey); err != nil {
+			// Close the session so the lock dies with it rather than leaking
+			// into a pooled connection that outlives this run.
+			lockConn.Conn().Close(unlockCtx)
+		}
+	}()
+
+	if _, err := lockConn.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS schema_migrations (
 			filename   TEXT PRIMARY KEY,
 			applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -96,7 +154,7 @@ func (s *PGStore) RunMigrations(ctx context.Context, migrationsDir string) error
 	}
 
 	applied := make(map[string]bool)
-	rows, err := s.pool.Query(ctx, `SELECT filename FROM schema_migrations`)
+	rows, err := lockConn.Query(ctx, `SELECT filename FROM schema_migrations`)
 	if err != nil {
 		return fmt.Errorf("read schema_migrations: %w", err)
 	}
@@ -121,7 +179,7 @@ func (s *PGStore) RunMigrations(ctx context.Context, migrationsDir string) error
 		if err != nil {
 			return fmt.Errorf("read migration %s: %w", f, err)
 		}
-		if err := s.applyMigration(ctx, f, string(data)); err != nil {
+		if err := s.applyMigration(ctx, lockConn, f, string(data)); err != nil {
 			return err
 		}
 	}
@@ -130,25 +188,25 @@ func (s *PGStore) RunMigrations(ctx context.Context, migrationsDir string) error
 
 // applyMigration executes one migration file and records it in
 // schema_migrations, atomically when the SQL succeeds. Pre-cutoff files that
-// fail with "already exists"/"duplicate key" are treated as already applied
-// on a database that predates bookkeeping and are recorded as such.
-func (s *PGStore) applyMigration(ctx context.Context, name, sql string) error {
-	tx, err := s.pool.Begin(ctx)
+// fail with a duplicate-object SQLSTATE are treated as already applied on a
+// database that predates bookkeeping and are recorded as such.
+// It runs on the dedicated lock session (statement_timeout exempted), so a
+// legitimately slow migration is not killed by the pool-wide query timeout.
+func (s *PGStore) applyMigration(ctx context.Context, conn *pgxpool.Conn, name, sql string) error {
+	tx, err := conn.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin migration %s: %w", name, err)
 	}
 	defer tx.Rollback(ctx)
 
 	if _, err := tx.Exec(ctx, sql); err != nil {
-		duplicate := strings.Contains(err.Error(), "already exists") ||
-			strings.Contains(err.Error(), "duplicate key")
-		if !duplicate || name >= legacyMigrationCutoff {
+		if !isAlreadyAppliedError(err) || name >= legacyMigrationCutoff {
 			return fmt.Errorf("exec migration %s: %w", name, err)
 		}
 		// Legacy file already applied before bookkeeping existed. The failed
-		// transaction is aborted (schema untouched), so record via the pool.
+		// transaction is aborted (schema untouched), so record outside it.
 		tx.Rollback(ctx)
-		if _, err := s.pool.Exec(ctx,
+		if _, err := conn.Exec(ctx,
 			`INSERT INTO schema_migrations (filename) VALUES ($1) ON CONFLICT (filename) DO NOTHING`,
 			name,
 		); err != nil {

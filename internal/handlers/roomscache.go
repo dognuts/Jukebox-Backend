@@ -16,6 +16,14 @@ const roomsListCacheTTL = 5 * time.Second
 // genre filter, so an attacker could otherwise grow the map without limit.
 const maxPayloadCacheEntries = 256
 
+// maxPayloadCacheKeyLen caps how long a key may be and still be cached.
+// Keys embed attacker-controlled query params (the genre filter), so without
+// a cap each of the maxPayloadCacheEntries slots could hold a string as large
+// as the request line allows, and oversized junk keys would churn out the hot
+// homepage entry. Longer keys are served uncached — worst case is the
+// pre-cache per-request rebuild, never memory growth or eviction pressure.
+const maxPayloadCacheKeyLen = 64
+
 // payloadCache is a tiny in-process TTL cache for marshaled JSON payloads
 // with singleflight semantics: concurrent misses on the same key share one
 // build instead of stampeding Postgres/Redis.
@@ -66,8 +74,12 @@ func (c *payloadCache) set(key string, data []byte) {
 
 // getOrBuild returns the cached payload for key, or runs build exactly once
 // for all concurrent callers and caches its result. Build errors are not
-// cached — the next request retries.
+// cached — the next request retries. Oversized keys (see
+// maxPayloadCacheKeyLen) bypass the cache entirely.
 func (c *payloadCache) getOrBuild(key string, build func() ([]byte, error)) ([]byte, error) {
+	if len(key) > maxPayloadCacheKeyLen {
+		return build()
+	}
 	if data, ok := c.get(key); ok {
 		return data, nil
 	}

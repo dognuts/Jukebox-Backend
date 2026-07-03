@@ -43,9 +43,10 @@ func main() {
 	}
 	defer pg.Close()
 
-	// Run migrations
+	// Run migrations. A failure is fatal: booting without the expected
+	// schema fails later in stranger ways than a loud restart loop.
 	if err := pg.RunMigrations(ctx, "migrations"); err != nil {
-		log.Printf("migrations warning: %v", err)
+		log.Fatalf("migrations: %v", err)
 	}
 
 	redis, err := store.NewRedisStore(cfg.RedisURL, cfg.SessionTTL)

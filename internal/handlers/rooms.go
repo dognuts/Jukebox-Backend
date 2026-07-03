@@ -205,7 +205,9 @@ type RoomWithNowPlaying struct {
 
 // setPublicCache marks a non-personalized response as briefly cacheable by
 // browsers and shared caches. Only use it on payloads that are identical for
-// every visitor — never on anything session-dependent.
+// every visitor — never on anything session-dependent, and never on the room
+// DETAIL endpoint, whose state transitions (go-live, end, queue changes)
+// must reach fresh page loads immediately.
 //
 // If an earlier middleware already attached a Set-Cookie (SessionMiddleware
 // mints a session cookie for first-time visitors — exactly the audience this
@@ -274,7 +276,14 @@ func (h *RoomHandler) buildRoomsList(ctx context.Context, liveOnly bool, genre s
 		}
 	}
 	counts := h.redis.GetListenerCounts(ctx, allIDs)
-	playbacks := h.redis.GetPlaybackStates(ctx, liveIDs)
+	// A Redis failure only costs the nowPlaying/listener enrichment here —
+	// the list itself still renders (the idle monitor, by contrast, must
+	// treat this error as "skip the tick").
+	playbacks, err := h.redis.GetPlaybackStates(ctx, liveIDs)
+	if err != nil {
+		log.Printf("list rooms: batch playback fetch: %v", err)
+		playbacks = map[string]*models.PlaybackState{}
+	}
 
 	// One query for every now-playing track instead of one GetTrack round
 	// trip per live room (N+1). A failed lookup only costs the nowPlaying
@@ -391,10 +400,12 @@ func (h *RoomHandler) Get(w http.ResponseWriter, r *http.Request) {
 		chat = []models.ChatMessage{}
 	}
 
-	// Nothing in the room detail payload is per-session (queue/chat entries
-	// carry their submitters' IDs, identical for every viewer), so let
-	// browsers reuse it briefly. Live updates flow over the WebSocket.
-	setPublicCache(w)
+	// Deliberately NO Cache-Control here (unlike the list endpoint): the
+	// detail payload carries room state that flips on go-live/end-session/
+	// queue-submit, and a cached copy — especially one revalidating in the
+	// background under stale-while-revalidate — would hand a first-paint
+	// fetch up to ~35s-old state right after a transition. Connected clients
+	// get updates over the WebSocket; fresh loads must see the truth.
 	writeJSON(w, http.StatusOK, models.RoomDetailResponse{
 		Room:          *room,
 		NowPlaying:    nowPlaying,

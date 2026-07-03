@@ -96,7 +96,14 @@ func (m *IdleMonitor) check() {
 	// for playback states and one aggregate Postgres query for queue counts,
 	// instead of two sequential round trips per live room while holding the
 	// lock every tick.
-	playbacks := m.redis.GetPlaybackStates(ctx, liveIDs)
+	playbacks, err := m.redis.GetPlaybackStates(ctx, liveIDs)
+	if err != nil {
+		// Without playback data we can't tell idle from active; skip this
+		// tick rather than treat a Redis outage as "every room is silent"
+		// and auto-close rooms that are mid-track.
+		log.Printf("[idle-monitor] playback states: %v", err)
+		return
+	}
 	queueCounts, err := m.pg.GetApprovedQueueCounts(ctx, liveIDs)
 	if err != nil {
 		// Without queue data we can't tell idle from active; skip this tick
@@ -135,13 +142,13 @@ func (m *IdleMonitor) check() {
 		if !tracked {
 			// First time noticing this room is idle
 			m.idleSince[room.ID] = now
-			log.Printf("[idle-monitor] room %s (%s) is idle, starting 5m timer", room.ID, room.Name)
+			log.Printf("[idle-monitor] room %s (%s) is idle, starting %s timer", room.ID, room.Name, idleTimeout)
 			continue
 		}
 
 		// Check if idle long enough
 		if now.Sub(since) >= idleTimeout {
-			log.Printf("[idle-monitor] room %s (%s) idle for >5m, auto-closing", room.ID, room.Name)
+			log.Printf("[idle-monitor] room %s (%s) idle for >%s, auto-closing", room.ID, room.Name, idleTimeout)
 			roomCopy := room
 			m.closeRoom(ctx, &roomCopy)
 			delete(m.idleSince, room.ID)

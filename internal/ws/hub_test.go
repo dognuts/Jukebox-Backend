@@ -110,6 +110,7 @@ type fakePresence struct {
 	mu          sync.Mutex
 	listeners   map[string]bool
 	addGate     chan struct{} // if non-nil, AddListener blocks until it is closed
+	addStarted  int           // AddListener calls entered (counted before the gate)
 	addCalls    int
 	removeCalls int
 }
@@ -119,8 +120,12 @@ func newFakePresence() *fakePresence {
 }
 
 func (f *fakePresence) AddListener(ctx context.Context, roomID, sessionID string) (int64, error) {
-	if f.addGate != nil {
-		<-f.addGate
+	f.mu.Lock()
+	f.addStarted++
+	gate := f.addGate
+	f.mu.Unlock()
+	if gate != nil {
+		<-gate
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -449,6 +454,129 @@ func TestChatBroadcastFirstThenPersisted(t *testing.T) {
 			t.Fatalf("chat message not persisted (got %d rows)", n)
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// Register-vs-stop race on the DJ-left/room-ended path: a client can pass
+// RegisterClient's stopping check and be in flight on the Register channel
+// when a stop path commits (sets stopping). The Run loop must refuse it —
+// never adding it to the Clients of a dying hub, where it would strand a
+// ghost listener in Redis and hang on a hub that no longer broadcasts —
+// and must tear it down so its pumps exit and the client reconnects fresh.
+func TestRegisterRejectedAfterStopCommitted(t *testing.T) {
+	h := newTestHub(t, newFakeStore(testRoom(models.RequestPolicyOpen)))
+
+	client := NewClient(h, nil, testSession("s-late", "Alice"))
+
+	// Reproduce the race window deterministically: claim the in-flight
+	// registration slot exactly as RegisterClient does (its stopping check
+	// passed), then let a stop path commit before the Run loop receives.
+	h.mu.Lock()
+	h.pendingRegs++
+	h.stopping = true
+	h.mu.Unlock()
+
+	select {
+	case h.Register <- client:
+	case <-time.After(time.Second):
+		t.Fatal("Run loop did not receive the in-flight registration")
+	}
+
+	// The loop must close the rejected client so its pumps exit.
+	select {
+	case <-client.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("rejected client was not closed")
+	}
+	// ...and release its ordering barrier: onRegister will never run for
+	// it, so a stray onUnregister must not wait on registered forever.
+	select {
+	case <-client.registered:
+	default:
+		t.Error("registered barrier not released for rejected client")
+	}
+
+	if n := h.clientCount(); n != 0 {
+		t.Fatalf("client count = %d, want 0 (client joined a stopping hub)", n)
+	}
+	h.mu.Lock()
+	pending := h.pendingRegs
+	h.mu.Unlock()
+	if pending != 0 {
+		t.Errorf("pendingRegs = %d, want 0", pending)
+	}
+}
+
+// listener_count broadcasts must be serialized with their presence
+// mutations: the per-client onRegister/onUnregister goroutines broadcast
+// independently, so two concurrent joins could read counts 1 and 2 from the
+// presence store but enqueue "2" before "1", leaving every client showing
+// the stale count until the next churn. Regression test for the countMu
+// (mutate, enqueue) pairing in updateListenerCount.
+func TestListenerCountBroadcastsInOrder(t *testing.T) {
+	pres := newFakePresence()
+	gate := make(chan struct{})
+	pres.addGate = gate
+
+	h := newTestHubWithPresence(t, newFakeStore(testRoom(models.RequestPolicyOpen)), pres)
+
+	// The observer joins directly (no registration broadcasts of its own)
+	// and records the fanout order.
+	observer := NewClient(h, nil, testSession("s-obs", "Watcher"))
+	addClient(h, observer)
+
+	c1 := NewClient(h, nil, testSession("s-1", "Alice"))
+	c2 := NewClient(h, nil, testSession("s-2", "Bob"))
+	if !h.RegisterClient(c1) || !h.RegisterClient(c2) {
+		t.Fatal("RegisterClient returned false on a live hub")
+	}
+
+	// One join must be inside AddListener (held open by the gate)...
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		pres.mu.Lock()
+		started := pres.addStarted
+		pres.mu.Unlock()
+		if started >= 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no AddListener call started")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	// ...while the other join is excluded from the mutation+broadcast
+	// critical section. Without that exclusion the second count can be
+	// enqueued ahead of the first.
+	time.Sleep(50 * time.Millisecond)
+	pres.mu.Lock()
+	started := pres.addStarted
+	pres.mu.Unlock()
+	if started != 1 {
+		t.Fatalf("addStarted = %d while the first count broadcast is pending, want 1 (mutation+broadcast not serialized)", started)
+	}
+
+	close(gate)
+
+	// The observer sees the counts in mutation order: 1 then 2.
+	var counts []int
+	countDeadline := time.After(2 * time.Second)
+	for len(counts) < 2 {
+		select {
+		case out := <-observer.Send:
+			var msg struct {
+				Event   string         `json:"event"`
+				Payload map[string]int `json:"payload"`
+			}
+			if json.Unmarshal(out.data, &msg) == nil && msg.Event == EventListenerCount {
+				counts = append(counts, msg.Payload["count"])
+			}
+		case <-countDeadline:
+			t.Fatalf("timed out waiting for listener_count frames, got %v", counts)
+		}
+	}
+	if counts[0] != 1 || counts[1] != 2 {
+		t.Fatalf("listener_count order = %v, want [1 2]", counts)
 	}
 }
 
