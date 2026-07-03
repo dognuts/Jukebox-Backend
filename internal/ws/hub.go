@@ -10,25 +10,96 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
 	"github.com/jukebox/backend/internal/middleware"
 	"github.com/jukebox/backend/internal/models"
 	"github.com/jukebox/backend/internal/store"
 )
 
+// dataStore is the slice of *store.PGStore the hub uses, declared as an
+// interface so tests can run the hub against an in-memory fake.
+type dataStore interface {
+	GetRoomByID(ctx context.Context, id string) (*models.Room, error)
+	WasRoomEverLive(ctx context.Context, roomID string) (bool, error)
+	DeleteRoom(ctx context.Context, roomID string) error
+	SetRoomLive(ctx context.Context, roomID string, live bool) error
+	EndRoom(ctx context.Context, roomID string) error
+	UpdateRoomPolicy(ctx context.Context, roomID string, policy models.RequestPolicy) error
+
+	GetTrack(ctx context.Context, id string) (*models.Track, error)
+	UpsertTrack(ctx context.Context, t *models.Track) error
+
+	GetQueue(ctx context.Context, roomID string) ([]models.QueueEntry, error)
+	GetPendingRequests(ctx context.Context, roomID string) ([]models.QueueEntry, error)
+	AddToQueue(ctx context.Context, entry *models.QueueEntry) error
+	UpdateQueueEntryStatus(ctx context.Context, entryID string, status models.QueueEntryStatus) error
+	PopNextTrack(ctx context.Context, roomID string) (*models.QueueEntry, error)
+	SetNowPlaying(ctx context.Context, roomID, trackID string) error
+	ClearNowPlaying(ctx context.Context, roomID string) error
+
+	InsertChatMessage(ctx context.Context, msg *models.ChatMessage) error
+	GetRecentChat(ctx context.Context, roomID string, limit int) ([]models.ChatMessage, error)
+
+	GetNeonTube(ctx context.Context, roomID string) (*models.NeonTube, error)
+
+	StartListenEvent(ctx context.Context, evt *models.ListenEvent) error
+	EndListenEvent(ctx context.Context, eventID string, tracksHeard int) error
+	EndListenEventsByUser(ctx context.Context, userID, roomID string) error
+}
+
+// presenceStore is the slice of *store.RedisStore the hub uses.
+type presenceStore interface {
+	AddListener(ctx context.Context, roomID, sessionID string) (int64, error)
+	RemoveListener(ctx context.Context, roomID, sessionID string) (int64, error)
+	GetPlaybackState(ctx context.Context, roomID string) (*models.PlaybackState, error)
+	SetPlaybackState(ctx context.Context, state *models.PlaybackState) error
+	ClearPlaybackState(ctx context.Context, roomID string) error
+	ClearListeners(ctx context.Context, roomID string) error
+}
+
 // Hub manages all WebSocket clients for a single room.
+//
+// Concurrency model: the Run loop owns only fast, in-memory work —
+// mutating the client set and fanning broadcasts out to per-client
+// buffers. Every blocking Postgres/Redis call runs on a side goroutine
+// (onRegister / onUnregister per event, plus the inboundLoop and
+// persistLoop workers), so one slow query can never freeze chat,
+// reactions, joins, or broadcasts for the whole room — and the loop can
+// never block on its own Broadcast channel (the classic self-deadlock:
+// sole consumer waiting to produce into the channel it drains).
 type Hub struct {
-	RoomID     string
-	RoomSlug   string
-	Clients    map[*Client]bool
-	Register   chan *Client
-	Unregister chan *Client
-	Inbound    chan *ClientMessage
-	Broadcast  chan []byte
-	mu         sync.RWMutex
+	RoomID            string
+	RoomSlug          string
+	Clients           map[*Client]bool
+	Register          chan *Client
+	Unregister        chan *Client
+	Inbound           chan *ClientMessage
+	Broadcast         chan []byte
+	mu                sync.RWMutex
 	listenerListTimer *time.Timer
 
-	pg    *store.PGStore
-	redis *store.RedisStore
+	// quit is closed exactly once (via stop) when the hub shuts down.
+	// Every producer selects on it so nothing can block forever on a
+	// dead hub's channels.
+	quit     chan struct{}
+	stopOnce sync.Once
+
+	// stopping and pendingRegs (both guarded by mu) make the idle-shutdown
+	// decision atomic with registration. pendingRegs counts clients
+	// accepted by RegisterClient but not yet added to Clients by the Run
+	// loop; stopping is set in the same critical section as the "no
+	// clients, none pending" check, and RegisterClient refuses once it is
+	// set — so a fresh client can never register into the window between
+	// that check and close(quit) and get torn down by a hub it just joined.
+	stopping    bool
+	pendingRegs int
+
+	// persistCh feeds persistLoop, which inserts chat messages into
+	// Postgres in FIFO order after they have been broadcast.
+	persistCh chan *models.ChatMessage
+
+	pg    dataStore
+	redis presenceStore
 
 	// OnAutoplayEnd is called when a listener reports the autoplay track ended
 	OnAutoplayEnd func(roomID string)
@@ -39,7 +110,7 @@ type Hub struct {
 }
 
 // NewHub creates a hub for the given room.
-func NewHub(roomID, roomSlug string, pg *store.PGStore, redis *store.RedisStore) *Hub {
+func NewHub(roomID, roomSlug string, pg dataStore, redis presenceStore) *Hub {
 	return &Hub{
 		RoomID:     roomID,
 		RoomSlug:   roomSlug,
@@ -48,6 +119,8 @@ func NewHub(roomID, roomSlug string, pg *store.PGStore, redis *store.RedisStore)
 		Unregister: make(chan *Client),
 		Inbound:    make(chan *ClientMessage, 256),
 		Broadcast:  make(chan []byte, 256),
+		quit:       make(chan struct{}),
+		persistCh:  make(chan *models.ChatMessage, 256),
 		pg:         pg,
 		redis:      redis,
 	}
@@ -55,139 +128,355 @@ func NewHub(roomID, roomSlug string, pg *store.PGStore, redis *store.RedisStore)
 
 // Run starts the hub's main event loop. Call in a goroutine.
 func (h *Hub) Run() {
+	// Blocking I/O lives on these workers, never on this loop.
+	go h.inboundLoop()
+	go h.persistLoop()
+
 	for {
 		select {
 		case client := <-h.Register:
 			h.mu.Lock()
 			h.Clients[client] = true
+			h.pendingRegs--
 			h.mu.Unlock()
-
-			// Update listener count
-			ctx := context.Background()
-			count, _ := h.redis.AddListener(ctx, h.RoomID, client.Session.ID)
-			h.broadcastListenerCount(int(count))
-
-			// Broadcast join activity
-			h.broadcastJSON(WSMessage{Event: "listener_join", Payload: map[string]string{
-				"username":    client.DisplayName(),
-				"avatarColor": client.Session.AvatarColor,
-			}})
-
-			// Start listen event for authenticated users
-			if client.UserID != "" {
-				evtID := client.Session.ID + ":" + h.RoomID
-				h.pg.EndListenEventsByUser(ctx, client.UserID, h.RoomID) // close any stale events
-				h.pg.StartListenEvent(ctx, &models.ListenEvent{
-					ID:        evtID,
-					UserID:    client.UserID,
-					RoomID:    h.RoomID,
-					StartedAt: time.Now(),
-				})
-			}
-
-			// Send current playback state to new client
-			h.sendInitialState(client)
+			// All join-time I/O (listener accounting, listen events,
+			// initial state replay) runs off the loop so a slow store
+			// can't stall the room. The client is broadcast-visible from
+			// this point, before its snapshot is replayed — see the
+			// interleaving note on sendInitialState.
+			go h.onRegister(client)
 
 		case client := <-h.Unregister:
 			h.mu.Lock()
 			if _, ok := h.Clients[client]; ok {
 				delete(h.Clients, client)
-				close(client.Send)
+				client.close()
 			}
-			clientCount := len(h.Clients)
 			h.mu.Unlock()
-
-			ctx := context.Background()
-			count, _ := h.redis.RemoveListener(ctx, h.RoomID, client.Session.ID)
-			h.broadcastListenerCount(int(count))
-
-			// Broadcast leave activity
-			h.broadcastJSON(WSMessage{Event: "listener_leave", Payload: map[string]string{
-				"username":    client.DisplayName(),
-				"avatarColor": client.Session.AvatarColor,
-			}})
-
-			// End listen event for authenticated users
-			if client.UserID != "" {
-				evtID := client.Session.ID + ":" + h.RoomID
-				h.pg.EndListenEvent(ctx, evtID, 0)
-			}
-
-			// If the DJ disconnects from a room that was NEVER live, auto-delete it.
-			// This prevents ghost rooms from piling up when DJs create rooms
-			// but leave before going live.
-			if client.IsDJ {
-				wasEverLive, err := h.pg.WasRoomEverLive(ctx, h.RoomID)
-				if err == nil && !wasEverLive {
-					log.Printf("[ws] DJ left room %s before going live — auto-deleting", h.RoomSlug)
-
-					// Notify any remaining listeners
-					h.broadcastJSON(WSMessage{
-						Event:   "room_ended",
-						Payload: map[string]string{"reason": "The DJ left before going live"},
-					})
-
-					// Clean up
-					h.pg.DeleteRoom(ctx, h.RoomID)
-					h.redis.ClearPlaybackState(ctx, h.RoomID)
-					h.redis.ClearListeners(ctx, h.RoomID)
-
-					if h.OnShutdown != nil {
-						h.OnShutdown(h.RoomID)
-					}
-					return // shut down this hub
-				}
-			}
-
-			// If no clients remain and room is no longer live, clean up this hub
-			if clientCount == 0 {
-				room, _ := h.pg.GetRoomByID(ctx, h.RoomID)
-				if room == nil || !room.IsLive {
-					log.Printf("[ws] hub %s has no clients and room is offline, shutting down", h.RoomSlug)
-					if h.OnShutdown != nil {
-						h.OnShutdown(h.RoomID)
-					}
-					return // exits the Run() goroutine
-				}
-			}
-
-		case msg := <-h.Inbound:
-			h.handleInbound(msg)
+			go h.onUnregister(client)
 
 		case message := <-h.Broadcast:
-			// Collect stale clients under read lock, then remove under write lock
-			var stale []*Client
-			h.mu.RLock()
-			for client := range h.Clients {
-				select {
-				case client.Send <- message:
-				default:
-					stale = append(stale, client)
-				}
-			}
-			h.mu.RUnlock()
+			h.fanout(message)
 
-			// Remove stale clients under write lock
-			if len(stale) > 0 {
-				h.mu.Lock()
-				for _, client := range stale {
-					if _, ok := h.Clients[client]; ok {
-						close(client.Send)
-						delete(h.Clients, client)
-					}
+		case <-h.quit:
+			// Flush queued broadcasts (e.g. the final room_ended) so
+			// they reach client buffers before the loop exits.
+			for {
+				select {
+				case message := <-h.Broadcast:
+					h.fanout(message)
+				default:
+					return
 				}
-				h.mu.Unlock()
 			}
 		}
 	}
 }
 
+// inboundLoop serializes handling of client actions for the room on a
+// goroutine separate from Run, so handler I/O (Postgres/Redis) never
+// blocks broadcast fanout, joins, or leaves. Single consumer = inbound
+// actions are still processed in arrival order.
+func (h *Hub) inboundLoop() {
+	for {
+		select {
+		case cm := <-h.Inbound:
+			h.handleInbound(cm)
+		case <-h.quit:
+			return
+		}
+	}
+}
+
+// persistLoop inserts broadcast-first chat messages into Postgres in
+// FIFO order, off every latency-sensitive path.
+//
+// Durability tradeoff: a chat message is shown to the room before it is
+// stored, so if the insert fails (or the process dies first) the message
+// is missing from the history replay. That's accepted — the alternative
+// was capping the whole room's chat throughput at one DB insert per
+// message and freezing chat whenever Postgres stalls.
+func (h *Hub) persistLoop() {
+	for {
+		select {
+		case msg := <-h.persistCh:
+			h.insertChat(msg)
+		case <-h.quit:
+			// Drain anything already queued, then exit.
+			for {
+				select {
+				case msg := <-h.persistCh:
+					h.insertChat(msg)
+				default:
+					return
+				}
+			}
+		}
+	}
+}
+
+func (h *Hub) insertChat(msg *models.ChatMessage) {
+	if err := h.pg.InsertChatMessage(context.Background(), msg); err != nil {
+		log.Printf("insert chat: %v", err)
+	}
+}
+
+// persistChat queues an already-broadcast chat message for insertion.
+// If the persistence worker is persistCh-cap messages behind, the
+// message is dropped from history (never from the live room) and logged.
+func (h *Hub) persistChat(msg *models.ChatMessage) {
+	select {
+	case h.persistCh <- msg:
+	default:
+		log.Printf("[ws] room %s: chat persist queue full, message %s dropped from history", h.RoomSlug, msg.ID)
+	}
+}
+
+// fanout delivers one marshaled broadcast to every client. The payload
+// is wrapped in a single PreparedMessage so permessage-deflate
+// compresses it once per broadcast rather than once per recipient.
+// Sends never block: a client whose send buffer is full is evicted
+// (disconnect policy — see sendBufferSize in client.go), so one slow
+// reader can't stall the room.
+func (h *Hub) fanout(message []byte) {
+	out := outbound{data: message}
+	if pm, err := websocket.NewPreparedMessage(websocket.TextMessage, message); err == nil {
+		out.prepared = pm
+	}
+
+	// Collect stale clients under read lock, then remove under write lock.
+	var stale []*Client
+	h.mu.RLock()
+	for client := range h.Clients {
+		if !client.send(out) {
+			stale = append(stale, client)
+		}
+	}
+	h.mu.RUnlock()
+
+	if len(stale) > 0 {
+		h.mu.Lock()
+		for _, client := range stale {
+			if _, ok := h.Clients[client]; ok {
+				client.close()
+				delete(h.Clients, client)
+			}
+		}
+		h.mu.Unlock()
+	}
+}
+
+// onRegister runs all join-time I/O for a newly registered client off
+// the hub loop, including the initial state replay.
+func (h *Hub) onRegister(client *Client) {
+	// Release this client's onUnregister once all join-time I/O is done
+	// (or has panicked) — see Client.registered for the ordering contract.
+	defer close(client.registered)
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[ws] panic in onRegister: %v", r)
+		}
+	}()
+
+	ctx := context.Background()
+
+	// Update listener count
+	count, _ := h.redis.AddListener(ctx, h.RoomID, client.Session.ID)
+	h.broadcastListenerCount(int(count))
+
+	// Broadcast join activity
+	h.broadcastJSON(WSMessage{Event: "listener_join", Payload: map[string]string{
+		"username":    client.DisplayName(),
+		"avatarColor": client.Session.AvatarColor,
+	}})
+
+	// Start listen event for authenticated users
+	if client.UserID != "" {
+		evtID := client.Session.ID + ":" + h.RoomID
+		h.pg.EndListenEventsByUser(ctx, client.UserID, h.RoomID) // close any stale events
+		h.pg.StartListenEvent(ctx, &models.ListenEvent{
+			ID:        evtID,
+			UserID:    client.UserID,
+			RoomID:    h.RoomID,
+			StartedAt: time.Now(),
+		})
+	}
+
+	// Send current playback state to new client
+	h.sendInitialState(client)
+}
+
+// onUnregister runs all leave-time I/O off the hub loop and decides
+// whether the hub should shut down.
+func (h *Hub) onUnregister(client *Client) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[ws] panic in onUnregister: %v", r)
+		}
+	}()
+
+	// Per-client ordering barrier: on a fast connect-then-disconnect this
+	// goroutine could otherwise overtake onRegister, running RemoveListener
+	// before AddListener (stranding a ghost session in the listeners set)
+	// and EndListenEvent before StartListenEvent (a never-ended row).
+	// onRegister always closes registered — even on panic — so this cannot
+	// wait forever, and it waits off the hub loop, never blocking the room.
+	<-client.registered
+
+	ctx := context.Background()
+	count, _ := h.redis.RemoveListener(ctx, h.RoomID, client.Session.ID)
+	h.broadcastListenerCount(int(count))
+
+	// Broadcast leave activity
+	h.broadcastJSON(WSMessage{Event: "listener_leave", Payload: map[string]string{
+		"username":    client.DisplayName(),
+		"avatarColor": client.Session.AvatarColor,
+	}})
+
+	// End listen event for authenticated users
+	if client.UserID != "" {
+		evtID := client.Session.ID + ":" + h.RoomID
+		h.pg.EndListenEvent(ctx, evtID, 0)
+	}
+
+	// If the DJ disconnects from a room that was NEVER live, auto-delete it.
+	// This prevents ghost rooms from piling up when DJs create rooms
+	// but leave before going live.
+	if client.IsDJ {
+		wasEverLive, err := h.pg.WasRoomEverLive(ctx, h.RoomID)
+		if err == nil && !wasEverLive {
+			log.Printf("[ws] DJ left room %s before going live — auto-deleting", h.RoomSlug)
+
+			// Notify any remaining listeners (flushed by Run before it exits)
+			h.broadcastJSON(WSMessage{
+				Event:   "room_ended",
+				Payload: map[string]string{"reason": "The DJ left before going live"},
+			})
+
+			// Clean up
+			h.pg.DeleteRoom(ctx, h.RoomID)
+			h.redis.ClearPlaybackState(ctx, h.RoomID)
+			h.redis.ClearListeners(ctx, h.RoomID)
+
+			h.stop()
+			return
+		}
+	}
+
+	// If no clients remain and room is no longer live, clean up this hub
+	if h.clientCount() == 0 {
+		room, _ := h.pg.GetRoomByID(ctx, h.RoomID)
+		if room == nil || !room.IsLive {
+			// Re-check after the DB round-trip, atomically with
+			// registration: counting pendingRegs and setting stopping in
+			// one critical section means no client can be in flight when
+			// we decide, and RegisterClient (which checks stopping under
+			// this same lock) refuses everyone after — closing the TOCTOU
+			// window between this check and close(quit).
+			h.mu.Lock()
+			idle := len(h.Clients) == 0 && h.pendingRegs == 0
+			if idle {
+				h.stopping = true
+			}
+			h.mu.Unlock()
+			if idle {
+				log.Printf("[ws] hub %s has no clients and room is offline, shutting down", h.RoomSlug)
+				h.stop()
+			}
+		}
+	}
+}
+
+func (h *Hub) clientCount() int {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return len(h.Clients)
+}
+
+// stop shuts the hub down exactly once: closing quit unblocks the Run
+// loop (which flushes queued broadcasts first) and both workers, and
+// OnShutdown removes the hub from its manager.
+func (h *Hub) stop() {
+	h.stopOnce.Do(func() {
+		// Mark stopping first so RegisterClient refuses new clients even
+		// on stop paths (DJ left, room ended) that didn't already set it.
+		h.mu.Lock()
+		h.stopping = true
+		h.mu.Unlock()
+		close(h.quit)
+		if h.OnShutdown != nil {
+			h.OnShutdown(h.RoomID)
+		}
+	})
+}
+
+// RegisterClient hands a new client to the hub loop. It returns false if
+// the hub has shut down or committed to shutting down (a race with the
+// room ending); the caller should drop the connection and let the client
+// reconnect onto a fresh hub.
+func (h *Hub) RegisterClient(c *Client) bool {
+	// Claim a pending-registration slot under mu: the idle-shutdown check
+	// in onUnregister counts pendingRegs and sets stopping under the same
+	// lock, so either this client is visible to that check (no shutdown)
+	// or stopping is already set here (refuse; client reconnects fresh).
+	h.mu.Lock()
+	if h.stopping {
+		h.mu.Unlock()
+		return false
+	}
+	h.pendingRegs++
+	h.mu.Unlock()
+
+	select {
+	case h.Register <- c:
+		return true
+	case <-h.quit:
+		h.mu.Lock()
+		h.pendingRegs--
+		h.mu.Unlock()
+		return false
+	}
+}
+
+// unregister hands a client back to the hub loop; if the hub has already
+// shut down it just marks the client closed so its WritePump exits.
+func (h *Hub) unregister(c *Client) {
+	select {
+	case h.Unregister <- c:
+	case <-h.quit:
+		c.close()
+	}
+}
+
+// sendInitialState replays the room snapshot to one newly joined client.
+//
+// Interleaving note: the client is added to the broadcast fanout (Clients
+// set) by the Run loop before this snapshot is assembled off-loop, so a
+// live broadcast can land before or between snapshot frames. Two visible
+// consequences, both transient and self-correcting: (1) a snapshot
+// queue_update read here may briefly overwrite a newer live queue_update
+// the client already received — corrected by the next queue change; and
+// (2) a chat message can arrive twice, once as the live broadcast and
+// once in the GetRecentChat replay, if its async persist lands before the
+// read — chat frames carry a stable message id, so clients should treat
+// delivery as at-least-once and dedupe on id. The alternative — holding
+// the client out of the fanout until the replay finishes — would silently
+// drop every broadcast made during the replay, which is strictly worse.
 func (h *Hub) sendInitialState(client *Client) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("[ws] panic in sendInitialState: %v", r)
 		}
 	}()
+
+	// WS CONTRACT (frozen): initial_state carries serverTime, the unix
+	// epoch in milliseconds at send time. Clients compute
+	// clockOffset = serverTime - Date.now() on receipt and add it when
+	// deriving playback position; clients tolerate the field being absent.
+	client.sendValue(struct {
+		Event      string `json:"event"`
+		ServerTime int64  `json:"serverTime"`
+	}{Event: EventInitialState, ServerTime: time.Now().UnixMilli()})
 
 	ctx := context.Background()
 
@@ -354,10 +643,11 @@ func (h *Hub) handleInbound(cm *ClientMessage) {
 			MediaType:   mediaType,
 		}
 
-		if err := h.pg.InsertChatMessage(ctx, chatMsg); err != nil {
-			log.Printf("insert chat: %v", err)
-		}
+		// Broadcast first, persist async (FIFO via persistLoop) so one
+		// slow insert can't cap the room's chat throughput. See
+		// persistLoop for the durability tradeoff.
 		h.broadcastJSON(WSMessage{Event: EventChatMessage, Payload: chatMsg})
+		h.persistChat(chatMsg)
 
 	case ActionReaction:
 		var p ReactionPayload
@@ -373,18 +663,18 @@ func (h *Hub) handleInbound(cm *ClientMessage) {
 	case ActionSubmitTrack:
 		var p SubmitTrackPayload
 		if err := json.Unmarshal(msg.Payload, &p); err != nil {
-			client.sendError("invalid track submission")
+			client.rejectSubmit("invalid track submission")
 			return
 		}
 
 		// Get room to check policy
 		room, _ := h.pg.GetRoomByID(ctx, h.RoomID)
 		if room == nil {
-			client.sendError("room not found")
+			client.rejectSubmit("room not found")
 			return
 		}
 		if room.RequestPolicy == models.RequestPolicyClosed && !client.IsDJ {
-			client.sendError("requests are closed for this room")
+			client.rejectSubmit("requests are closed for this room")
 			return
 		}
 
@@ -400,7 +690,7 @@ func (h *Hub) handleInbound(cm *ClientMessage) {
 		}
 		if err := h.pg.UpsertTrack(ctx, track); err != nil {
 			log.Printf("upsert track: %v", err)
-			client.sendError("failed to save track")
+			client.rejectSubmit("failed to save track")
 			return
 		}
 
@@ -421,9 +711,13 @@ func (h *Hub) handleInbound(cm *ClientMessage) {
 		}
 		if err := h.pg.AddToQueue(ctx, entry); err != nil {
 			log.Printf("add to queue: %v", err)
-			client.sendError("failed to add to queue")
+			client.rejectSubmit("failed to add to queue")
 			return
 		}
+
+		// WS CONTRACT (frozen): confirm the submission directly to the
+		// submitting client before any broadcast echo.
+		client.sendSubmitResult(true, "")
 
 		if status == models.QueueApproved {
 			// Broadcast updated queue to everyone
@@ -542,8 +836,9 @@ func (h *Hub) handleInbound(cm *ClientMessage) {
 			Type:        models.ChatTypeAnnouncement,
 			Timestamp:   time.Now(),
 		}
-		h.pg.InsertChatMessage(ctx, chatMsg)
+		// Broadcast first, persist async — same path as regular chat.
 		h.broadcastJSON(WSMessage{Event: EventChatMessage, Payload: chatMsg})
+		h.persistChat(chatMsg)
 
 	case ActionDJGoLive:
 		if !client.IsDJ {
@@ -723,12 +1018,30 @@ func (h *Hub) broadcastJSON(msg WSMessage) {
 	if err != nil {
 		return
 	}
-	h.Broadcast <- data
+	h.enqueueBroadcast(data)
 }
 
-// BroadcastJSON is the exported version for use by HTTP handlers.
+// BroadcastJSON is the exported version for use by HTTP handlers and the
+// playback services. The payload is marshaled exactly once and the send
+// never blocks the caller.
 func (h *Hub) BroadcastJSON(msg WSMessage) {
 	h.broadcastJSON(msg)
+}
+
+// enqueueBroadcast hands a marshaled payload to the fanout loop without
+// ever blocking. The Run loop is the sole consumer of Broadcast, so a
+// blocking send from inside the hub's own goroutines could deadlock the
+// room; and once the hub has shut down nothing drains the channel at
+// all. Policy: if the buffer is full (only possible under a pathological
+// burst, since fanout does no I/O) the message is dropped and logged.
+func (h *Hub) enqueueBroadcast(data []byte) {
+	select {
+	case h.Broadcast <- data:
+	case <-h.quit:
+		// Hub already shut down; drop silently.
+	default:
+		log.Printf("[ws] room %s: broadcast buffer full, dropping message", h.RoomSlug)
+	}
 }
 
 func (h *Hub) broadcastListenerCount(count int) {
@@ -785,10 +1098,7 @@ func (h *Hub) notifyDJs(msg WSMessage) {
 	defer h.mu.RUnlock()
 	for client := range h.Clients {
 		if client.IsDJ {
-			select {
-			case client.Send <- data:
-			default:
-			}
+			client.send(outbound{data: data})
 		}
 	}
 }

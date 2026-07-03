@@ -163,6 +163,45 @@ func TestBatchPlaylistInserts(t *testing.T) {
 	}
 }
 
+// TestGetTracksByIDs proves the rooms-list batch fetch: one ANY($1) query
+// returns every existing track keyed by ID, IDs with no row are simply
+// absent (the handler degrades to no nowPlaying), and empty input returns
+// an empty map without touching the database.
+func TestGetTracksByIDs(t *testing.T) {
+	s := newBatchTestDB(t)
+	ctx := context.Background()
+
+	tracks := batchTestTracks(3)
+	if err := s.UpsertTracks(ctx, tracks); err != nil {
+		t.Fatalf("UpsertTracks: %v", err)
+	}
+
+	got, err := s.GetTracksByIDs(ctx, []string{"track-0", "track-2", "track-missing"})
+	if err != nil {
+		t.Fatalf("GetTracksByIDs: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d tracks, want 2 (missing ID must be absent, not an error)", len(got))
+	}
+	for _, id := range []string{"track-0", "track-2"} {
+		tr := got[id]
+		if tr == nil {
+			t.Fatalf("track %s missing from result", id)
+		}
+		if tr.ID != id || tr.Artist != "Artist" || tr.Duration != 180 {
+			t.Errorf("track %s = %+v, want the upserted row", id, tr)
+		}
+	}
+	if _, ok := got["track-missing"]; ok {
+		t.Error("nonexistent ID present in result map")
+	}
+
+	empty, err := s.GetTracksByIDs(ctx, nil)
+	if err != nil || len(empty) != 0 {
+		t.Errorf("empty input: got (%v, %v), want empty map", empty, err)
+	}
+}
+
 // TestGetApprovedQueueCounts proves the idle monitor's aggregate: one query,
 // approved entries only, absent rooms read as zero.
 func TestGetApprovedQueueCounts(t *testing.T) {

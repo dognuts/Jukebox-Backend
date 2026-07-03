@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"log"
 	"sync"
 	"time"
@@ -140,7 +139,7 @@ func (s *SyncService) advanceTrack(roomID string) {
 
 		s.redis.ClearPlaybackState(ctx, roomID)
 		s.pg.ClearNowPlaying(ctx, roomID)
-		hub.Broadcast <- marshalMsg(ws.WSMessage{Event: ws.EventTrackChanged, Payload: nil})
+		hub.BroadcastJSON(ws.WSMessage{Event: ws.EventTrackChanged, Payload: nil})
 		log.Printf("[playback] room %s queue empty", roomID)
 		return
 	}
@@ -156,11 +155,11 @@ func (s *SyncService) advanceTrack(roomID string) {
 	}
 	s.redis.SetPlaybackState(ctx, ps)
 
-	hub.Broadcast <- marshalMsg(ws.WSMessage{Event: ws.EventTrackChanged, Payload: entry.Track})
-	hub.Broadcast <- marshalMsg(ws.WSMessage{Event: ws.EventPlaybackState, Payload: ps})
+	hub.BroadcastJSON(ws.WSMessage{Event: ws.EventTrackChanged, Payload: entry.Track})
+	hub.BroadcastJSON(ws.WSMessage{Event: ws.EventPlaybackState, Payload: ps})
 
 	queue, _ := s.pg.GetQueue(ctx, roomID)
-	hub.Broadcast <- marshalMsg(ws.WSMessage{Event: ws.EventQueueUpdate, Payload: queue})
+	hub.BroadcastJSON(ws.WSMessage{Event: ws.EventQueueUpdate, Payload: queue})
 
 	s.ScheduleAdvance(roomID, &entry.Track, ps.StartedAtUnix)
 
@@ -197,7 +196,7 @@ func (s *SyncService) advanceAutoplay(ctx context.Context, roomID string, hub *w
 		log.Printf("[autoplay] room %s: no autoplay tracks available", roomID)
 		s.redis.ClearPlaybackState(ctx, roomID)
 		s.pg.ClearNowPlaying(ctx, roomID)
-		hub.Broadcast <- marshalMsg(ws.WSMessage{Event: ws.EventTrackChanged, Payload: nil})
+		hub.BroadcastJSON(ws.WSMessage{Event: ws.EventTrackChanged, Payload: nil})
 		return
 	}
 
@@ -232,8 +231,8 @@ func (s *SyncService) advanceAutoplay(ctx context.Context, roomID string, hub *w
 	}
 	s.redis.SetPlaybackState(ctx, ps)
 
-	hub.Broadcast <- marshalMsg(ws.WSMessage{Event: ws.EventTrackChanged, Payload: track})
-	hub.Broadcast <- marshalMsg(ws.WSMessage{Event: ws.EventPlaybackState, Payload: ps})
+	hub.BroadcastJSON(ws.WSMessage{Event: ws.EventTrackChanged, Payload: track})
+	hub.BroadcastJSON(ws.WSMessage{Event: ws.EventPlaybackState, Payload: ps})
 
 	s.ScheduleAdvance(roomID, track, ps.StartedAtUnix)
 
@@ -312,9 +311,4 @@ func (s *SyncService) StartAutoplayRooms(ctx context.Context) {
 	if len(rooms) > 0 {
 		log.Printf("✓ Started %d autoplay room(s)", len(rooms))
 	}
-}
-
-func marshalMsg(msg ws.WSMessage) []byte {
-	data, _ := json.Marshal(msg)
-	return data
 }

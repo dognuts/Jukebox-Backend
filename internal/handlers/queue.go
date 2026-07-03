@@ -116,12 +116,13 @@ func (h *QueueHandler) SubmitTrack(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Notify connected clients via WebSocket hub
+	// Notify connected clients via WebSocket hub. BroadcastJSON never
+	// blocks — a raw send into hub.Broadcast could strand this handler
+	// goroutine forever if the hub had already shut down.
 	if hub := h.hubs.Get(room.ID); hub != nil {
 		if status == models.QueueApproved {
 			queue, _ := h.pg.GetQueue(ctx, room.ID)
-			data, _ := json.Marshal(ws.WSMessage{Event: ws.EventQueueUpdate, Payload: queue})
-			hub.Broadcast <- data
+			hub.BroadcastJSON(ws.WSMessage{Event: ws.EventQueueUpdate, Payload: queue})
 		}
 	}
 

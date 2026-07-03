@@ -70,19 +70,21 @@ func (h *WSHandler) HandleRoomWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	conn.EnableWriteCompression(true)
-	conn.SetCompressionLevel(6) // balanced speed vs size
+	// Level 1, not 6: gorilla negotiates permessage-deflate without
+	// context takeover, so every frame is compressed independently and
+	// higher levels buy only a few percent on this app's mostly-small
+	// JSON frames while costing several times the CPU. The larger frames
+	// (queue updates, chat replay) still shrink well at level 1, and
+	// broadcast frames are wrapped in a single PreparedMessage (see
+	// ws.Hub fanout) so they are compressed once per broadcast rather
+	// than once per recipient.
+	conn.SetCompressionLevel(1)
 
 	// Get or create hub for this room
 	hub := h.hubs.GetOrCreate(room.ID, room.Slug)
 
 	// Create client
-	client := &ws.Client{
-		Hub:     hub,
-		Conn:    conn,
-		Send:    make(chan []byte, 256),
-		Session: session,
-		IsDJ:    false,
-	}
+	client := ws.NewClient(hub, conn, session)
 
 	// Set user if authenticated (from middleware or token query param)
 	if user := middleware.GetUser(ctx); user != nil {
@@ -104,8 +106,13 @@ func (h *WSHandler) HandleRoomWS(w http.ResponseWriter, r *http.Request) {
 	djKey := middleware.ExtractDJKey(r)
 	ws.SetDJKey(client, djKey, room.DJKeyHash)
 
-	// Register with hub
-	hub.Register <- client
+	// Register with hub. This can only fail if the hub shut down between
+	// lookup and registration (room just ended) — drop the connection and
+	// let the client's reconnect land on a fresh hub.
+	if !hub.RegisterClient(client) {
+		conn.Close()
+		return
+	}
 
 	log.Printf("[ws] client connected to room %s (session=%s, isDJ=%v)", room.Slug, session.ID, client.IsDJ)
 
