@@ -625,3 +625,96 @@ func TestUnregisterWaitsForRegisterIO(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 }
+
+// waitForMicState scans the client's outbound frames until a dj_mic_state
+// with the wanted active value arrives, skipping every other frame
+// (duplicate mic frames are legal at-least-once delivery).
+func waitForMicState(t *testing.T, c *Client, wantActive bool, timeout time.Duration) {
+	t.Helper()
+	deadline := time.After(timeout)
+	for {
+		select {
+		case out := <-c.Send:
+			var msg struct {
+				Event   string `json:"event"`
+				Payload struct {
+					Active bool `json:"active"`
+				} `json:"payload"`
+			}
+			if json.Unmarshal(out.data, &msg) == nil && msg.Event == EventDJMicState && msg.Payload.Active == wantActive {
+				return
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for dj_mic_state active=%v", wantActive)
+		}
+	}
+}
+
+// A listener who joins while the DJ's mic is already live must receive the
+// current mic state during initial state (not wait for the next toggle),
+// and the state must clear (with a mic-off broadcast) when the DJ leaves.
+//
+// The DJ is inserted with addClient (no onRegister) so its initial-state
+// goroutine cannot replay the mic event; the only mic-on frame the DJ can
+// receive is the toggle's broadcast fanout, which makes it a deterministic
+// sync point: once the DJ has the frame, the fanout snapshot is complete
+// and a client added afterwards can only learn the state via replay.
+func TestMicStateReplayedToLateJoinerAndClearedOnDJLeave(t *testing.T) {
+	h := newTestHub(t, newFakeStore(testRoom(models.RequestPolicyOpen)))
+
+	dj := NewClient(h, nil, testSession("s-dj", "DJ Nova"))
+	dj.IsDJ = true
+	addClient(h, dj)
+	close(dj.registered) // addClient bypasses onRegister; release the barrier
+
+	payload, err := json.Marshal(struct {
+		Active     bool `json:"active"`
+		PauseMusic bool `json:"pauseMusic"`
+	}{Active: true, PauseMusic: true})
+	if err != nil {
+		t.Fatalf("marshal mic payload: %v", err)
+	}
+	select {
+	case h.Inbound <- &ClientMessage{Client: dj, Message: InboundMessage{Action: ActionDJMic, Payload: payload}}:
+	case <-time.After(time.Second):
+		t.Fatal("inbound channel blocked")
+	}
+	waitForMicState(t, dj, true, 2*time.Second) // fanout complete
+
+	// Late joiner: the replay is the only possible mic-on source.
+	late := NewClient(h, nil, testSession("s-late", "Late"))
+	addClient(h, late)
+	h.sendInitialState(late)
+	waitForMicState(t, late, true, 2*time.Second)
+
+	// DJ leaves: remaining listeners hear mic-off.
+	select {
+	case h.Unregister <- dj:
+	case <-time.After(time.Second):
+		t.Fatal("unregister channel blocked")
+	}
+	waitForMicState(t, late, false, 2*time.Second)
+
+	// A joiner after the off-broadcast must get no stale mic-on replay.
+	// sendInitialState is synchronous, so its frames are queued when it
+	// returns; mic-off fanout frames may also be present and are fine.
+	late2 := NewClient(h, nil, testSession("s-late2", "Later"))
+	addClient(h, late2)
+	h.sendInitialState(late2)
+	for {
+		select {
+		case out := <-late2.Send:
+			var msg struct {
+				Event   string `json:"event"`
+				Payload struct {
+					Active bool `json:"active"`
+				} `json:"payload"`
+			}
+			if json.Unmarshal(out.data, &msg) == nil && msg.Event == EventDJMicState && msg.Payload.Active {
+				t.Fatal("stale mic-on replayed to a joiner after the DJ left")
+			}
+		default:
+			return
+		}
+	}
+}

@@ -106,6 +106,14 @@ type Hub struct {
 	// (mutate, enqueue) atomic makes counts arrive in order.
 	countMu sync.Mutex
 
+	// micState mirrors the last dj_mic_state broadcast (guarded by mu) so
+	// clients that join while the DJ's mic is already live receive the
+	// current state during sendInitialState instead of waiting for the
+	// next toggle.
+	micActive     bool
+	micPauseMusic bool
+	micDJName     string
+
 	// persistCh feeds persistLoop, which inserts chat messages into
 	// Postgres in FIFO order after they have been broadcast.
 	persistCh chan *models.ChatMessage
@@ -367,6 +375,27 @@ func (h *Hub) onUnregister(client *Client) {
 		h.pg.EndListenEvent(ctx, evtID, 0)
 	}
 
+	// The publisher is gone: clear mic state and tell listeners, so their
+	// voice UI doesn't wait for a toggle that will never come and a future
+	// joiner doesn't get a stale mic replay.
+	if client.IsDJ {
+		h.mu.Lock()
+		wasMicActive := h.micActive
+		h.micActive = false
+		h.micPauseMusic = false
+		h.mu.Unlock()
+		if wasMicActive {
+			h.broadcastJSON(WSMessage{
+				Event: EventDJMicState,
+				Payload: map[string]interface{}{
+					"active":     false,
+					"pauseMusic": false,
+					"djName":     client.DisplayName(),
+				},
+			})
+		}
+	}
+
 	// If the DJ disconnects from a room that was NEVER live, auto-delete it.
 	// This prevents ghost rooms from piling up when DJs create rooms
 	// but leave before going live.
@@ -585,6 +614,21 @@ func (h *Hub) sendInitialState(client *Client) {
 	if room != nil {
 		client.SendJSON(WSMessage{Event: EventRoomSettings, Payload: map[string]interface{}{
 			"requestPolicy": room.RequestPolicy,
+		}})
+	}
+
+	// Replay the DJ's live mic state so a late joiner connects to voice
+	// immediately instead of waiting for the next toggle. Same event and
+	// payload shape as the ActionDJMic broadcast, so clients handle a
+	// replay and a live toggle identically.
+	h.mu.RLock()
+	micActive, micPause, micDJ := h.micActive, h.micPauseMusic, h.micDJName
+	h.mu.RUnlock()
+	if micActive {
+		client.SendJSON(WSMessage{Event: EventDJMicState, Payload: map[string]interface{}{
+			"active":     true,
+			"pauseMusic": micPause,
+			"djName":     micDJ,
 		}})
 	}
 
@@ -979,6 +1023,11 @@ func (h *Hub) handleInbound(cm *ClientMessage) {
 			client.sendError("invalid mic payload")
 			return
 		}
+		h.mu.Lock()
+		h.micActive = micPayload.Active
+		h.micPauseMusic = micPayload.PauseMusic
+		h.micDJName = client.DisplayName()
+		h.mu.Unlock()
 		h.broadcastJSON(WSMessage{
 			Event: EventDJMicState,
 			Payload: map[string]interface{}{
