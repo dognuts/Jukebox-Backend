@@ -454,6 +454,35 @@ type CreatorPoolAllocation struct {
 	EarningsCents  int    `json:"earningsCents"`
 }
 
+// ---------- DJ Public Profile ----------
+
+// DJProfile is the payload of GET /api/djs/{username}. The field shapes are
+// a frozen API contract with the frontend: nullable fields marshal as JSON
+// null (never ""), stats/recentShows are always present (0 / [] when the
+// schema has no data).
+type DJProfile struct {
+	Username        string         `json:"username"`
+	DisplayName     string         `json:"displayName"`
+	Bio             *string        `json:"bio"`
+	AvatarURL       *string        `json:"avatarUrl"`
+	IsLive          bool           `json:"isLive"`
+	CurrentRoomSlug *string        `json:"currentRoomSlug"`
+	Genre           *string        `json:"genre"`
+	Stats           DJStats        `json:"stats"`
+	RecentShows     []DJRecentShow `json:"recentShows"`
+}
+
+type DJStats struct {
+	TotalShows     int `json:"totalShows"`
+	TotalListeners int `json:"totalListeners"`
+}
+
+type DJRecentShow struct {
+	Date       time.Time `json:"date"`
+	RoomName   string    `json:"roomName"`
+	TrackCount int       `json:"trackCount"`
+}
+
 // ---------- Autoplay ----------
 
 type AutoplayTrack struct {

@@ -2,8 +2,9 @@ package playback
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"log"
 	"sync"
 	"time"
@@ -166,6 +167,29 @@ func (s *SyncService) advanceTrack(roomID string) {
 	log.Printf("[playback] room %s now playing: %s - %s", roomID, entry.Track.Artist, entry.Track.Title)
 }
 
+// autoplayTrackID derives the stable synthetic track ID for an autoplay
+// room + source URL. Earlier versions embedded a timestamp
+// ("auto-<room>-<idx>-<unixmilli>"), so every advance inserted a brand-new
+// tracks row — ~360 rows/day for a 24/7 room — that nothing ever deleted.
+// A deterministic ID makes the upsert actually dedupe: one row per
+// (room, source URL) no matter how many times the playlist loops. The room
+// is part of the key so per-room info snippets never bleed across rooms
+// playing the same URL.
+//
+// Legacy timestamped auto-* rows from before this change are left in place —
+// no automated destructive cleanup is shipped. They can be removed manually
+// once nothing references them, e.g.:
+//
+//	DELETE FROM tracks t
+//	WHERE t.id ~ '^auto-.*-[0-9]+-[0-9]+$'
+//	  AND NOT EXISTS (SELECT 1 FROM now_playing np WHERE np.track_id = t.id)
+//	  AND NOT EXISTS (SELECT 1 FROM queue_entries q WHERE q.track_id = t.id)
+//	  AND NOT EXISTS (SELECT 1 FROM playlist_tracks pt WHERE pt.track_id = t.id)
+func autoplayTrackID(roomID, sourceURL string) string {
+	sum := sha256.Sum256([]byte(roomID + "\x00" + sourceURL))
+	return "auto-" + hex.EncodeToString(sum[:8])
+}
+
 // advanceAutoplay pulls the next track from the room's live autoplay playlist.
 func (s *SyncService) advanceAutoplay(ctx context.Context, roomID string, hub *ws.Hub) {
 	autoTrack, idx, err := s.pg.GetNextAutoplayTrack(ctx, roomID)
@@ -179,7 +203,7 @@ func (s *SyncService) advanceAutoplay(ctx context.Context, roomID string, hub *w
 
 	// Create a Track from the autoplay track
 	track := &models.Track{
-		ID:            fmt.Sprintf("auto-%s-%d-%d", roomID[:8], idx, time.Now().UnixMilli()),
+		ID:            autoplayTrackID(roomID, autoTrack.SourceURL),
 		Title:         autoTrack.Title,
 		Artist:        autoTrack.Artist,
 		Duration:      autoTrack.Duration,
@@ -190,8 +214,10 @@ func (s *SyncService) advanceAutoplay(ctx context.Context, roomID string, hub *w
 		CreatedAt:     time.Now(),
 	}
 
-	// Insert into tracks table so GetNowPlaying JOIN works
-	if err := s.pg.UpsertTrack(ctx, track); err != nil {
+	// Find-or-refresh the synthetic tracks row so the GetNowPlaying JOIN
+	// resolves. The stable ID means replays reuse the same row (with metadata
+	// refreshed) instead of growing the tracks table on every advance.
+	if err := s.pg.UpsertAutoplayTrack(ctx, track); err != nil {
 		log.Printf("[autoplay] room %s: failed to upsert track: %v", roomID, err)
 	}
 

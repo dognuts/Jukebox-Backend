@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"regexp"
@@ -19,14 +20,15 @@ import (
 )
 
 type RoomHandler struct {
-	pg       *store.PGStore
-	redis    *store.RedisStore
-	hubs     *ws.HubManager
-	playback *playback.SyncService
+	pg        *store.PGStore
+	redis     *store.RedisStore
+	hubs      *ws.HubManager
+	playback  *playback.SyncService
+	listCache *payloadCache
 }
 
 func NewRoomHandler(pg *store.PGStore, redis *store.RedisStore, hubs *ws.HubManager, pb *playback.SyncService) *RoomHandler {
-	return &RoomHandler{pg: pg, redis: redis, hubs: hubs, playback: pb}
+	return &RoomHandler{pg: pg, redis: redis, hubs: hubs, playback: pb, listCache: newPayloadCache(roomsListCacheTTL)}
 }
 
 var slugRe = regexp.MustCompile(`[^a-z0-9]+`)
@@ -147,7 +149,9 @@ func (h *RoomHandler) Create(w http.ResponseWriter, r *http.Request) {
 		} else if len(pl.Tracks) == 0 {
 			log.Printf("[room] playlist %s has no tracks", req.PlaylistID)
 		} else {
-			loaded := 0
+			now := time.Now()
+			tracks := make([]*models.Track, len(pl.Tracks))
+			entries := make([]*models.QueueEntry, len(pl.Tracks))
 			for i, pt := range pl.Tracks {
 				// Ensure the track exists in the tracks table (it should, but be safe)
 				track := &models.Track{
@@ -158,29 +162,30 @@ func (h *RoomHandler) Create(w http.ResponseWriter, r *http.Request) {
 					Source:        models.TrackSource(pt.Source),
 					SourceURL:     pt.SourceUrl,
 					AlbumGradient: pt.AlbumGradient,
-					CreatedAt:     time.Now(),
+					CreatedAt:     now,
 				}
-				if err := h.pg.UpsertTrack(r.Context(), track); err != nil {
-					log.Printf("[room] pre-load: failed to upsert track %d (%s): %v", i, pt.TrackID, err)
-					continue
-				}
-
-				entry := &models.QueueEntry{
+				tracks[i] = track
+				entries[i] = &models.QueueEntry{
 					ID:          uuid.New().String(),
 					RoomID:      room.ID,
 					Track:       *track,
 					SubmittedBy: djName,
 					SessionID:   session.ID,
 					Status:      models.QueueApproved,
-					CreatedAt:   time.Now(),
+					CreatedAt:   now,
 				}
-				if err := h.pg.AddToQueue(r.Context(), entry); err != nil {
-					log.Printf("[room] pre-load: failed to queue track %d (%s - %s): %v", i, pt.Artist, pt.Title, err)
-					continue
-				}
-				loaded++
 			}
-			log.Printf("[room] pre-loaded %d/%d tracks from playlist '%s' into room %s", loaded, len(pl.Tracks), pl.Name, room.Slug)
+			// Two batched statements — upsert every track, then append every
+			// queue entry with positions computed in SQL — instead of three
+			// sequential round trips per track (a 200-track playlist used to
+			// mean ~600 queries inside this one request).
+			if err := h.pg.UpsertTracks(r.Context(), tracks); err != nil {
+				log.Printf("[room] pre-load: failed to upsert %d tracks: %v", len(tracks), err)
+			} else if err := h.pg.AddTracksToQueue(r.Context(), room.ID, entries); err != nil {
+				log.Printf("[room] pre-load: failed to queue %d tracks: %v", len(entries), err)
+			} else {
+				log.Printf("[room] pre-loaded %d/%d tracks from playlist '%s' into room %s", len(entries), len(pl.Tracks), pl.Name, room.Slug)
+			}
 		}
 	}
 
@@ -190,24 +195,71 @@ func (h *RoomHandler) Create(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// RoomWithNowPlaying is one item of the /api/rooms payload: a room plus its
+// now-playing track and (for the featured room) a small chat preview.
+type RoomWithNowPlaying struct {
+	models.Room
+	NowPlaying *models.Track        `json:"nowPlaying,omitempty"`
+	RecentChat []models.ChatMessage `json:"recentChat,omitempty"`
+}
+
+// setPublicCache marks a non-personalized response as briefly cacheable by
+// browsers and shared caches. Only use it on payloads that are identical for
+// every visitor — never on anything session-dependent.
+//
+// If an earlier middleware already attached a Set-Cookie (SessionMiddleware
+// mints a session cookie for first-time visitors — exactly the audience this
+// caching targets), the response IS personalized: a shared cache honoring
+// "public" could replay one visitor's session cookie to everyone else
+// (RFC 6265 §3 warns against Set-Cookie on cacheable responses). Emit
+// no-store instead so no cache keeps the cookie-bearing variant.
+func setPublicCache(w http.ResponseWriter) {
+	if len(w.Header().Values("Set-Cookie")) > 0 {
+		w.Header().Set("Cache-Control", "no-store")
+		return
+	}
+	w.Header().Set("Cache-Control", "public, max-age=5, stale-while-revalidate=30")
+}
+
 // GET /api/rooms
 func (h *RoomHandler) List(w http.ResponseWriter, r *http.Request) {
 	liveOnly := r.URL.Query().Get("live") == "true"
 	genre := r.URL.Query().Get("genre")
 
-	rooms, err := h.pg.ListRooms(r.Context(), liveOnly, genre)
+	// The payload is identical for every visitor (nothing in it is
+	// per-session), so build it at most once per TTL window — singleflight
+	// collapses concurrent misses — and let browsers/CDNs reuse it briefly.
+	key := fmt.Sprintf("live=%t&genre=%s", liveOnly, genre)
+	data, err := h.listCache.getOrBuild(key, func() ([]byte, error) {
+		// Detached context: the build is shared across requests, so it must
+		// not die with whichever request happened to trigger it.
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		result, err := h.buildRoomsList(ctx, liveOnly, genre)
+		if err != nil {
+			return nil, err
+		}
+		return json.Marshal(result)
+	})
 	if err != nil {
 		log.Printf("list rooms: %v", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 
-	// Enrich with listener counts and now-playing track from Redis
-	ctx := r.Context()
-	type RoomWithNowPlaying struct {
-		models.Room
-		NowPlaying *models.Track         `json:"nowPlaying,omitempty"`
-		RecentChat []models.ChatMessage  `json:"recentChat,omitempty"`
+	setPublicCache(w)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write(data)
+}
+
+// buildRoomsList assembles the full rooms-list payload: rooms from Postgres,
+// listener counts and playback states from Redis (one pipeline each), and
+// all now-playing tracks in a single batched query.
+func (h *RoomHandler) buildRoomsList(ctx context.Context, liveOnly bool, genre string) ([]RoomWithNowPlaying, error) {
+	rooms, err := h.pg.ListRooms(ctx, liveOnly, genre)
+	if err != nil {
+		return nil, err
 	}
 
 	// Batch Redis reads: one pipeline for listener counts across all rooms,
@@ -224,6 +276,48 @@ func (h *RoomHandler) List(w http.ResponseWriter, r *http.Request) {
 	counts := h.redis.GetListenerCounts(ctx, allIDs)
 	playbacks := h.redis.GetPlaybackStates(ctx, liveIDs)
 
+	// One query for every now-playing track instead of one GetTrack round
+	// trip per live room (N+1). A failed lookup only costs the nowPlaying
+	// enrichment, matching the old best-effort per-track behavior.
+	tracks, err := h.pg.GetTracksByIDs(ctx, nowPlayingTrackIDs(rooms, playbacks))
+	if err != nil {
+		log.Printf("list rooms: batch track fetch: %v", err)
+		tracks = map[string]*models.Track{}
+	}
+
+	result := assembleRoomsList(rooms, counts, playbacks, tracks)
+
+	// Attach a small chat preview to the featured room so the homepage
+	// can render the featured card at final size in one pass.
+	if idx := featuredRoomIndex(result); idx >= 0 {
+		if chat, _ := h.pg.GetRecentChat(ctx, result[idx].ID, 3); chat != nil {
+			result[idx].RecentChat = chat
+		}
+	}
+
+	return result, nil
+}
+
+// nowPlayingTrackIDs collects the distinct track IDs currently playing in
+// live rooms, for a single batched fetch.
+func nowPlayingTrackIDs(rooms []models.Room, playbacks map[string]*models.PlaybackState) []string {
+	seen := make(map[string]bool)
+	var ids []string
+	for i := range rooms {
+		if !rooms[i].IsLive {
+			continue
+		}
+		if ps := playbacks[rooms[i].ID]; ps != nil && ps.TrackID != "" && !seen[ps.TrackID] {
+			seen[ps.TrackID] = true
+			ids = append(ids, ps.TrackID)
+		}
+	}
+	return ids
+}
+
+// assembleRoomsList merges rooms with their listener counts, playback states
+// and batch-fetched tracks. Pure — testable without Postgres/Redis.
+func assembleRoomsList(rooms []models.Room, counts map[string]int64, playbacks map[string]*models.PlaybackState, tracks map[string]*models.Track) []RoomWithNowPlaying {
 	result := make([]RoomWithNowPlaying, len(rooms))
 	for i := range rooms {
 		rooms[i].ListenerCount = int(counts[rooms[i].ID])
@@ -231,48 +325,34 @@ func (h *RoomHandler) List(w http.ResponseWriter, r *http.Request) {
 
 		if rooms[i].IsLive {
 			if ps := playbacks[rooms[i].ID]; ps != nil && ps.TrackID != "" {
-				track, _ := h.pg.GetTrack(ctx, ps.TrackID)
-				if track != nil {
-					result[i].NowPlaying = track
-				}
+				result[i].NowPlaying = tracks[ps.TrackID]
 			}
 		}
 	}
+	return result
+}
 
-	if result == nil {
-		result = []RoomWithNowPlaying{}
-	}
-
-	// Attach a small chat preview to the featured room so the homepage
-	// can render the featured card at final size in one pass. Mirrors
-	// the frontend's featured-picking logic: IsFeatured flag wins,
-	// otherwise the live room with the most listeners.
-	featuredIdx := -1
+// featuredRoomIndex mirrors the frontend's featured-picking logic: the
+// IsFeatured flag wins, otherwise the live room with the most listeners.
+// Returns -1 when no room qualifies.
+func featuredRoomIndex(result []RoomWithNowPlaying) int {
 	for i := range result {
 		if result[i].IsLive && result[i].IsFeatured {
+			return i
+		}
+	}
+	featuredIdx := -1
+	var best int
+	for i := range result {
+		if !result[i].IsLive {
+			continue
+		}
+		if featuredIdx < 0 || result[i].ListenerCount > best {
 			featuredIdx = i
-			break
+			best = result[i].ListenerCount
 		}
 	}
-	if featuredIdx < 0 {
-		var best int
-		for i := range result {
-			if !result[i].IsLive {
-				continue
-			}
-			if featuredIdx < 0 || result[i].ListenerCount > best {
-				featuredIdx = i
-				best = result[i].ListenerCount
-			}
-		}
-	}
-	if featuredIdx >= 0 {
-		if chat, _ := h.pg.GetRecentChat(ctx, result[featuredIdx].ID, 3); chat != nil {
-			result[featuredIdx].RecentChat = chat
-		}
-	}
-
-	writeJSON(w, http.StatusOK, result)
+	return featuredIdx
 }
 
 // GET /api/rooms/{slug}
@@ -311,6 +391,10 @@ func (h *RoomHandler) Get(w http.ResponseWriter, r *http.Request) {
 		chat = []models.ChatMessage{}
 	}
 
+	// Nothing in the room detail payload is per-session (queue/chat entries
+	// carry their submitters' IDs, identical for every viewer), so let
+	// browsers reuse it briefly. Live updates flow over the WebSocket.
+	setPublicCache(w)
 	writeJSON(w, http.StatusOK, models.RoomDetailResponse{
 		Room:          *room,
 		NowPlaying:    nowPlaying,
@@ -488,30 +572,45 @@ func (h *RoomHandler) SaveSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Add now-playing track first if it's not already in the list
-	added := map[string]bool{}
-	if nowPlayingTrackID != "" {
-		h.pg.AddTrackToPlaylist(r.Context(), &models.PlaylistTrack{
-			ID: uuid.New().String(), TrackID: nowPlayingTrackID,
-		}, pl.ID)
-		added[nowPlayingTrackID] = true
+	// One batched INSERT (positions computed in SQL) instead of a
+	// SELECT MAX + INSERT + UPDATE round trip per track.
+	trackIDs := sessionPlaylistTrackIDs(nowPlayingTrackID, allTracks)
+	rowIDs := make([]string, len(trackIDs))
+	for i := range rowIDs {
+		rowIDs[i] = uuid.New().String()
 	}
-
-	// Add all session tracks
-	for _, entry := range allTracks {
-		if added[entry.Track.ID] {
-			continue
-		}
-		h.pg.AddTrackToPlaylist(r.Context(), &models.PlaylistTrack{
-			ID: uuid.New().String(), TrackID: entry.Track.ID,
-		}, pl.ID)
-		added[entry.Track.ID] = true
+	if err := h.pg.AddTracksToPlaylist(r.Context(), pl.ID, rowIDs, trackIDs); err != nil {
+		log.Printf("save session: add %d tracks to playlist %s: %v", len(trackIDs), pl.ID, err)
+		h.pg.DeletePlaylist(r.Context(), pl.ID) // best-effort: don't leave an empty shell behind
+		http.Error(w, "failed to save playlist", http.StatusInternalServerError)
+		return
 	}
 
 	writeJSON(w, http.StatusCreated, map[string]interface{}{
 		"playlist":   pl,
-		"trackCount": len(added),
+		"trackCount": len(trackIDs),
 	})
+}
+
+// sessionPlaylistTrackIDs builds the ordered, deduplicated track ID list for
+// a saved session: the now-playing track (if any) first, then every played +
+// queued track in queue order. Pure — testable without Postgres.
+func sessionPlaylistTrackIDs(nowPlayingTrackID string, entries []models.QueueEntry) []string {
+	seen := make(map[string]bool, len(entries)+1)
+	ids := make([]string, 0, len(entries)+1)
+	if nowPlayingTrackID != "" {
+		seen[nowPlayingTrackID] = true
+		ids = append(ids, nowPlayingTrackID)
+	}
+	for i := range entries {
+		id := entries[i].Track.ID
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		ids = append(ids, id)
+	}
+	return ids
 }
 
 // GET /api/rooms/{slug}/autoplay-tracks — public endpoint for autoplay playlist

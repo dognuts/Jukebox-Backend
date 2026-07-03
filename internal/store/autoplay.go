@@ -159,6 +159,30 @@ func (s *PGStore) GetNextAutoplayTrack(ctx context.Context, roomID string) (*mod
 	return track, nextIdx, nil
 }
 
+// UpsertAutoplayTrack inserts or refreshes the synthetic tracks row backing
+// an autoplay room's now-playing JOIN. Unlike UpsertTrack (DO NOTHING on
+// conflict), a conflict here updates the metadata: autoplay track IDs are
+// stable across advances (see playback's autoplayTrackID), so playlist edits
+// — retitles, snippet changes, corrected durations — must land on the
+// existing row when the track comes around again. A duration learned from a
+// client report (UpdateTrackDuration) is kept when the playlist still says 0.
+func (s *PGStore) UpsertAutoplayTrack(ctx context.Context, t *models.Track) error {
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO tracks (id, title, artist, duration, source, source_url, album_gradient, info_snippet, created_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+		ON CONFLICT (id) DO UPDATE SET
+			title = EXCLUDED.title,
+			artist = EXCLUDED.artist,
+			duration = CASE WHEN EXCLUDED.duration > 0 THEN EXCLUDED.duration ELSE tracks.duration END,
+			source = EXCLUDED.source,
+			source_url = EXCLUDED.source_url,
+			album_gradient = EXCLUDED.album_gradient,
+			info_snippet = EXCLUDED.info_snippet`,
+		t.ID, t.Title, t.Artist, t.Duration, t.Source, t.SourceURL, t.AlbumGradient, t.InfoSnippet, t.CreatedAt,
+	)
+	return err
+}
+
 // GetAutoplayRooms returns all rooms with is_autoplay = true.
 func (s *PGStore) GetAutoplayRooms(ctx context.Context) ([]models.Room, error) {
 	rows, err := s.pool.Query(ctx,

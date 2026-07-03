@@ -85,6 +85,26 @@ func (m *IdleMonitor) check() {
 		return
 	}
 
+	liveIDs := make([]string, 0, len(rooms))
+	for i := range rooms {
+		if rooms[i].IsLive {
+			liveIDs = append(liveIDs, rooms[i].ID)
+		}
+	}
+
+	// Batch the per-room reads BEFORE taking the mutex: one Redis pipeline
+	// for playback states and one aggregate Postgres query for queue counts,
+	// instead of two sequential round trips per live room while holding the
+	// lock every tick.
+	playbacks := m.redis.GetPlaybackStates(ctx, liveIDs)
+	queueCounts, err := m.pg.GetApprovedQueueCounts(ctx, liveIDs)
+	if err != nil {
+		// Without queue data we can't tell idle from active; skip this tick
+		// rather than risk auto-closing a room that still has tracks queued.
+		log.Printf("[idle-monitor] queue counts: %v", err)
+		return
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -98,12 +118,11 @@ func (m *IdleMonitor) check() {
 		activeRoomIDs[room.ID] = true
 
 		// Check if room has playback state (track playing)
-		ps, _ := m.redis.GetPlaybackState(ctx, room.ID)
+		ps := playbacks[room.ID]
 		hasPlayback := ps != nil && ps.TrackID != ""
 
 		// Check if room has queued tracks
-		queue, _ := m.pg.GetQueue(ctx, room.ID)
-		hasQueue := len(queue) > 0
+		hasQueue := queueCounts[room.ID] > 0
 
 		if hasPlayback || hasQueue {
 			// Room is active — remove from idle tracking

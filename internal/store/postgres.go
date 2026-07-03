@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -22,18 +23,22 @@ func nilIfEmpty(s string) interface{} {
 }
 
 type PGStore struct {
-	pool *pgxpool.Pool
+	pool *dbPool
 }
 
 func NewPGStore(ctx context.Context, databaseURL string) (*PGStore, error) {
-	pool, err := pgxpool.New(ctx, databaseURL)
+	cfg, err := newPoolConfig(databaseURL)
 	if err != nil {
-		return nil, fmt.Errorf("pgxpool.New: %w", err)
+		return nil, err
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("pgxpool.NewWithConfig: %w", err)
 	}
 	if err := pool.Ping(ctx); err != nil {
 		return nil, fmt.Errorf("ping: %w", err)
 	}
-	return &PGStore{pool: pool}, nil
+	return &PGStore{pool: wrapPool(pool, envDuration("PG_QUERY_TIMEOUT", defaultQueryTimeout))}, nil
 }
 
 func (s *PGStore) Close() {
@@ -60,23 +65,121 @@ func (s *PGStore) ResetAllRoomsOffline(ctx context.Context) error {
 	return nil
 }
 
-// RunMigrations reads and executes the migration files in order.
+// legacyMigrationCutoff marks the transition to schema_migrations bookkeeping.
+// Migrations sorting before this prefix (001–012) shipped before the
+// bookkeeping table existed, so on older databases they may already be applied
+// without being recorded. Only those files tolerate "already exists" errors on
+// re-run; every migration from 013 onward runs strictly and fails loudly.
+// This set is closed — it can never grow, so do not raise the cutoff.
+const legacyMigrationCutoff = "013"
+
+// RunMigrations executes every *.up.sql file in migrationsDir in lexicographic
+// order, recording applied files in a schema_migrations table so each
+// migration runs exactly once.
+//
+// Databases migrated before schema_migrations existed are handled per file:
+// each file executes as a single implicit transaction, so on an
+// already-migrated database a pre-cutoff file fails atomically with
+// "already exists", leaves the schema untouched, and is recorded as applied.
 func (s *PGStore) RunMigrations(ctx context.Context, migrationsDir string) error {
-	files := []string{"001_initial.up.sql", "002_user_accounts.up.sql", "003_messages_playlists.up.sql", "004_room_ended.up.sql", "005_admin.up.sql", "006_location_listen.up.sql", "007_stage_name.up.sql", "008_unique_stage_name.up.sql", "009_monetization.up.sql", "010_add_banned.up.sql", "011_autoplay.up.sql", "012_track_info_snippet.up.sql"}
+	if _, err := s.pool.Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS schema_migrations (
+			filename   TEXT PRIMARY KEY,
+			applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`); err != nil {
+		return fmt.Errorf("create schema_migrations: %w", err)
+	}
+
+	files, err := listUpMigrations(migrationsDir)
+	if err != nil {
+		return err
+	}
+
+	applied := make(map[string]bool)
+	rows, err := s.pool.Query(ctx, `SELECT filename FROM schema_migrations`)
+	if err != nil {
+		return fmt.Errorf("read schema_migrations: %w", err)
+	}
+	for rows.Next() {
+		var f string
+		if err := rows.Scan(&f); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan schema_migrations: %w", err)
+		}
+		applied[f] = true
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("read schema_migrations: %w", err)
+	}
+
 	for _, f := range files {
+		if applied[f] {
+			continue
+		}
 		data, err := os.ReadFile(migrationsDir + "/" + f)
 		if err != nil {
 			return fmt.Errorf("read migration %s: %w", f, err)
 		}
-		_, err = s.pool.Exec(ctx, string(data))
-		if err != nil {
-			if !strings.Contains(err.Error(), "already exists") &&
-				!strings.Contains(err.Error(), "duplicate key") {
-				return fmt.Errorf("exec migration %s: %w", f, err)
-			}
+		if err := s.applyMigration(ctx, f, string(data)); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+// applyMigration executes one migration file and records it in
+// schema_migrations, atomically when the SQL succeeds. Pre-cutoff files that
+// fail with "already exists"/"duplicate key" are treated as already applied
+// on a database that predates bookkeeping and are recorded as such.
+func (s *PGStore) applyMigration(ctx context.Context, name, sql string) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin migration %s: %w", name, err)
+	}
+	defer tx.Rollback(ctx)
+
+	if _, err := tx.Exec(ctx, sql); err != nil {
+		duplicate := strings.Contains(err.Error(), "already exists") ||
+			strings.Contains(err.Error(), "duplicate key")
+		if !duplicate || name >= legacyMigrationCutoff {
+			return fmt.Errorf("exec migration %s: %w", name, err)
+		}
+		// Legacy file already applied before bookkeeping existed. The failed
+		// transaction is aborted (schema untouched), so record via the pool.
+		tx.Rollback(ctx)
+		if _, err := s.pool.Exec(ctx,
+			`INSERT INTO schema_migrations (filename) VALUES ($1) ON CONFLICT (filename) DO NOTHING`,
+			name,
+		); err != nil {
+			return fmt.Errorf("record migration %s: %w", name, err)
+		}
+		return nil
+	}
+
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO schema_migrations (filename) VALUES ($1)`, name,
+	); err != nil {
+		return fmt.Errorf("record migration %s: %w", name, err)
+	}
+	return tx.Commit(ctx)
+}
+
+// listUpMigrations returns the *.up.sql files in dir in lexicographic order.
+// Numeric prefixes are zero-padded, so this is application order.
+func listUpMigrations(dir string) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("read migrations dir %s: %w", dir, err)
+	}
+	var files []string
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".up.sql") {
+			files = append(files, e.Name())
+		}
+	}
+	sort.Strings(files)
+	return files, nil
 }
 
 // ==================== Rooms ====================
@@ -260,6 +363,43 @@ func (s *PGStore) UpsertTrack(ctx context.Context, t *models.Track) error {
 	return err
 }
 
+// UpsertTracks inserts many tracks in a single multi-row statement
+// (ON CONFLICT DO NOTHING, matching UpsertTrack). One round trip regardless
+// of track count — playlist pre-load used to issue one INSERT per track.
+func (s *PGStore) UpsertTracks(ctx context.Context, tracks []*models.Track) error {
+	if len(tracks) == 0 {
+		return nil
+	}
+	n := len(tracks)
+	ids := make([]string, n)
+	titles := make([]string, n)
+	artists := make([]string, n)
+	durations := make([]int32, n)
+	sources := make([]string, n)
+	sourceURLs := make([]string, n)
+	gradients := make([]string, n)
+	snippets := make([]string, n)
+	createdAts := make([]time.Time, n)
+	for i, t := range tracks {
+		ids[i] = t.ID
+		titles[i] = t.Title
+		artists[i] = t.Artist
+		durations[i] = int32(t.Duration)
+		sources[i] = string(t.Source)
+		sourceURLs[i] = t.SourceURL
+		gradients[i] = t.AlbumGradient
+		snippets[i] = t.InfoSnippet
+		createdAts[i] = t.CreatedAt
+	}
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO tracks (id, title, artist, duration, source, source_url, album_gradient, info_snippet, created_at)
+		SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::int4[], $5::text[], $6::text[], $7::text[], $8::text[], $9::timestamptz[])
+		ON CONFLICT (id) DO NOTHING`,
+		ids, titles, artists, durations, sources, sourceURLs, gradients, snippets, createdAts,
+	)
+	return err
+}
+
 func (s *PGStore) UpdateTrackDuration(ctx context.Context, trackID string, duration int) error {
 	_, err := s.pool.Exec(ctx,
 		`UPDATE tracks SET duration = $2 WHERE id = $1 AND duration = 0`, trackID, duration)
@@ -284,6 +424,32 @@ func (s *PGStore) GetTrack(ctx context.Context, id string) (*models.Track, error
 	return t, err
 }
 
+// GetTracksByIDs fetches many tracks in a single query (WHERE id = ANY).
+// Returns a map keyed by track ID; IDs with no matching row are absent.
+// Used by the rooms list to avoid one GetTrack round-trip per live room.
+func (s *PGStore) GetTracksByIDs(ctx context.Context, ids []string) (map[string]*models.Track, error) {
+	out := make(map[string]*models.Track, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, title, artist, duration, source, source_url, album_gradient, created_at
+		FROM tracks WHERE id = ANY($1)`, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		t := &models.Track{}
+		if err := rows.Scan(&t.ID, &t.Title, &t.Artist, &t.Duration, &t.Source, &t.SourceURL, &t.AlbumGradient, &t.CreatedAt); err != nil {
+			return nil, err
+		}
+		out[t.ID] = t
+	}
+	return out, rows.Err()
+}
+
 // ==================== Queue ====================
 
 func (s *PGStore) AddToQueue(ctx context.Context, entry *models.QueueEntry) error {
@@ -303,6 +469,43 @@ func (s *PGStore) AddToQueue(ctx context.Context, entry *models.QueueEntry) erro
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
 		entry.ID, entry.RoomID, entry.Track.ID, entry.SubmittedBy, entry.SessionID,
 		entry.Status, entry.Position, entry.CreatedAt,
+	)
+	return err
+}
+
+// AddTracksToQueue appends many entries to a room's queue in one statement.
+// Positions are computed in SQL — a single MAX read plus the row ordinal —
+// so there is no SELECT MAX round trip per entry and no cross-statement
+// read-then-write race within the batch (the MAX subquery and the inserts
+// share one snapshot).
+func (s *PGStore) AddTracksToQueue(ctx context.Context, roomID string, entries []*models.QueueEntry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	n := len(entries)
+	ids := make([]string, n)
+	trackIDs := make([]string, n)
+	submitters := make([]string, n)
+	sessionIDs := make([]string, n)
+	statuses := make([]string, n)
+	createdAts := make([]time.Time, n)
+	for i, e := range entries {
+		ids[i] = e.ID
+		trackIDs[i] = e.Track.ID
+		submitters[i] = e.SubmittedBy
+		sessionIDs[i] = e.SessionID
+		statuses[i] = string(e.Status)
+		createdAts[i] = e.CreatedAt
+	}
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO queue_entries (id, room_id, track_id, submitted_by, session_id, status, position, created_at)
+		SELECT e.id, $1, e.track_id, e.submitted_by, e.session_id, e.status,
+			(SELECT COALESCE(MAX(position), 0) FROM queue_entries
+			 WHERE room_id = $1 AND status IN ('pending','approved')) + e.ord::int,
+			e.created_at
+		FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::timestamptz[])
+			WITH ORDINALITY AS e(id, track_id, submitted_by, session_id, status, created_at, ord)`,
+		roomID, ids, trackIDs, submitters, sessionIDs, statuses, createdAts,
 	)
 	return err
 }
@@ -361,6 +564,36 @@ func (s *PGStore) GetPendingRequests(ctx context.Context, roomID string) ([]mode
 		entries = append(entries, e)
 	}
 	return entries, nil
+}
+
+// GetApprovedQueueCounts returns the number of approved queue entries per
+// room in one aggregate query. Rooms with no approved entries are absent
+// from the map. Used by the idle monitor instead of one full GetQueue round
+// trip per live room per tick.
+func (s *PGStore) GetApprovedQueueCounts(ctx context.Context, roomIDs []string) (map[string]int, error) {
+	out := make(map[string]int, len(roomIDs))
+	if len(roomIDs) == 0 {
+		return out, nil
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT room_id, COUNT(*)
+		FROM queue_entries
+		WHERE room_id = ANY($1) AND status = 'approved'
+		GROUP BY room_id`, roomIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var id string
+		var count int
+		if err := rows.Scan(&id, &count); err != nil {
+			return nil, err
+		}
+		out[id] = count
+	}
+	return out, rows.Err()
 }
 
 func (s *PGStore) UpdateQueueEntryStatus(ctx context.Context, entryID string, status models.QueueEntryStatus) error {

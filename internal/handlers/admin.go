@@ -5,7 +5,6 @@ import (
 	"log"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -75,10 +74,15 @@ func (h *AdminHandler) ListRooms(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Enrich with listener counts
+	// Enrich with listener counts — one pipelined round trip for all rooms
+	// instead of one SCARD per room.
+	ids := make([]string, len(rooms))
 	for i := range rooms {
-		count, _ := h.redis.GetListenerCount(ctx, rooms[i].ID)
-		rooms[i].ListenerCount = int(count)
+		ids[i] = rooms[i].ID
+	}
+	counts := h.redis.GetListenerCounts(ctx, ids)
+	for i := range rooms {
+		rooms[i].ListenerCount = int(counts[rooms[i].ID])
 	}
 
 	writeJSON(w, http.StatusOK, rooms)
@@ -600,7 +604,7 @@ func (h *AdminHandler) UpdateLiveSnippets(w http.ResponseWriter, r *http.Request
 	// tracks-table row and tell live listeners about it.
 	nowPlaying, _ := h.pg.GetNowPlaying(ctx, roomID)
 	if nowPlaying != nil {
-		if idx, ok := parseAutoplayTrackIndex(nowPlaying.ID); ok && idx < len(playlist.Tracks) {
+		if idx := autoplayTrackIndexBySourceURL(playlist.Tracks, nowPlaying.SourceURL); idx >= 0 {
 			newSnippet := playlist.Tracks[idx].InfoSnippet
 			if newSnippet != nowPlaying.InfoSnippet {
 				_ = h.pg.UpdateTrackInfoSnippet(ctx, nowPlaying.ID, newSnippet)
@@ -727,22 +731,23 @@ func (h *AdminHandler) UpdateLiveTracks(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, playlist)
 }
 
-// parseAutoplayTrackIndex extracts the playlist index encoded in autoplay
-// track IDs of the form "auto-{roomIDPrefix}-{idx}-{timestamp}". Returns
-// (0,false) for any other ID shape.
-func parseAutoplayTrackIndex(trackID string) (int, bool) {
-	if !strings.HasPrefix(trackID, "auto-") {
-		return 0, false
+// autoplayTrackIndexBySourceURL finds the playlist index of the track with
+// the given source URL, or -1 if absent. Autoplay track IDs used to encode
+// the playlist index ("auto-{room}-{idx}-{ts}"), which UpdateLiveSnippets
+// parsed to map the now-playing row back to a playlist position; the IDs are
+// now stable hashes (see playback's autoplayTrackID), so match on source URL
+// — the same key UpdateLiveTracks already reconciles with. If the same URL
+// appears twice in a playlist the first occurrence wins.
+func autoplayTrackIndexBySourceURL(tracks []models.AutoplayTrack, sourceURL string) int {
+	if sourceURL == "" {
+		return -1
 	}
-	parts := strings.Split(trackID, "-")
-	if len(parts) < 4 {
-		return 0, false
+	for i := range tracks {
+		if tracks[i].SourceURL == sourceURL {
+			return i
+		}
 	}
-	idx, err := strconv.Atoi(parts[2])
-	if err != nil || idx < 0 {
-		return 0, false
-	}
-	return idx, true
+	return -1
 }
 
 // POST /api/admin/autoplay/rooms/{id}/activate — promote staged to live

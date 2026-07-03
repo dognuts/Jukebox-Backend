@@ -1,4 +1,4 @@
-.PHONY: build run dev test clean migrate docker-up docker-down
+.PHONY: build run dev test test-migrations clean migrate docker-up docker-down
 
 # Build the server binary
 build:
@@ -15,6 +15,11 @@ dev:
 # Run tests
 test:
 	go test ./... -v
+
+# Migration integration tests against the docker-compose Postgres
+# (run `make docker-up` first; creates and drops throwaway databases)
+test-migrations:
+	TEST_DATABASE_URL="postgres://jukebox:jukebox@localhost:5432/jukebox?sslmode=disable" go test ./internal/store/ -run TestRunMigrations -v
 
 # Clean build artifacts
 clean:

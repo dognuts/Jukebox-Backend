@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -104,6 +105,35 @@ func (s *PGStore) AddTrackToPlaylist(ctx context.Context, pt *models.PlaylistTra
 		VALUES ($1, $2, $3, $4, $5)
 		ON CONFLICT (playlist_id, track_id) DO NOTHING`,
 		pt.ID, playlistID, pt.TrackID, maxPos+1, time.Now(),
+	)
+	if err == nil {
+		s.pool.Exec(ctx, `UPDATE playlists SET updated_at = NOW() WHERE id = $1`, playlistID)
+	}
+	return err
+}
+
+// AddTracksToPlaylist appends many tracks to a playlist in one INSERT ...
+// SELECT: positions continue after the current MAX via the row ordinal
+// (first track of an empty playlist gets position 0, matching
+// AddTrackToPlaylist), so there is no SELECT MAX + INSERT + UPDATE triplet
+// per track. Tracks already in the playlist are skipped by the unique
+// (playlist_id, track_id) constraint. ids and trackIDs are parallel slices:
+// ids[i] becomes the playlist_tracks row ID for trackIDs[i].
+func (s *PGStore) AddTracksToPlaylist(ctx context.Context, playlistID string, ids, trackIDs []string) error {
+	if len(trackIDs) == 0 {
+		return nil
+	}
+	if len(ids) != len(trackIDs) {
+		return fmt.Errorf("AddTracksToPlaylist: %d row IDs for %d tracks", len(ids), len(trackIDs))
+	}
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO playlist_tracks (id, playlist_id, track_id, position, added_at)
+		SELECT e.id, $1, e.track_id,
+			(SELECT COALESCE(MAX(position), -1) FROM playlist_tracks WHERE playlist_id = $1) + e.ord::int,
+			NOW()
+		FROM unnest($2::text[], $3::text[]) WITH ORDINALITY AS e(id, track_id, ord)
+		ON CONFLICT (playlist_id, track_id) DO NOTHING`,
+		playlistID, ids, trackIDs,
 	)
 	if err == nil {
 		s.pool.Exec(ctx, `UPDATE playlists SET updated_at = NOW() WHERE id = $1`, playlistID)

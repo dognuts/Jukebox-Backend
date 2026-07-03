@@ -96,6 +96,7 @@ func main() {
 	authH := handlers.NewAuthHandler(pg, redis, emailSvc, cfg.JWTSecret, cfg.TurnstileSecretKey, signupLimiter)
 	msgH := handlers.NewMessageHandler(pg)
 	plH := handlers.NewPlaylistHandler(pg)
+	djH := handlers.NewDJHandler(pg)
 	// YouTube search client is optional: nil when YOUTUBE_DATA_API_KEY is unset,
 	// which causes the admin bulk-search endpoint to return 503 with a clear message.
 	var ytClient *youtube.Client
@@ -235,6 +236,9 @@ func main() {
 
 		// Featured room (public)
 		r.Get("/featured", adminH.GetFeatured)
+
+		// DJ profiles (public)
+		r.Get("/djs/{username}", djH.GetProfile)
 
 		// Billing / Monetization
 		r.Get("/billing/pricing", monH.GetPricing)
