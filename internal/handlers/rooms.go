@@ -69,6 +69,11 @@ func (h *RoomHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if err := validateCoverArt(req.CoverArt); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
 	// Generate DJ key
 	djKey, djKeyHash, err := middleware.GenerateDJKey()
 	if err != nil {
@@ -296,6 +301,11 @@ func (h *RoomHandler) buildRoomsList(ctx context.Context, liveOnly bool, genre s
 
 	result := assembleRoomsList(rooms, counts, playbacks, tracks)
 
+	// Blank oversized legacy data: covers before this payload is marshaled and
+	// cached — a list can embed many covers, and the homepage embeds the whole
+	// list into its ISR page. Operates on the wire slice, not the DB rows.
+	stripListCovers(result)
+
 	// Attach a small chat preview to the featured room so the homepage
 	// can render the featured card at final size in one pass.
 	if idx := featuredRoomIndex(result); idx >= 0 {
@@ -406,13 +416,18 @@ func (h *RoomHandler) Get(w http.ResponseWriter, r *http.Request) {
 	// background under stale-while-revalidate — would hand a first-paint
 	// fetch up to ~35s-old state right after a transition. Connected clients
 	// get updates over the WebSocket; fresh loads must see the truth.
-	writeJSON(w, http.StatusOK, models.RoomDetailResponse{
+	resp := models.RoomDetailResponse{
 		Room:          *room,
 		NowPlaying:    nowPlaying,
 		Queue:         queue,
 		RecentChat:    chat,
 		PlaybackState: *ps,
-	})
+	}
+	// Blank an oversized legacy data: cover on the wire copy (room/[slug] embeds
+	// this into its ISR page). Detail carries one cover, so it gets the more
+	// permissive cap. The DB row (*room) is left untouched.
+	resp.Room.CoverArtURL = stripOversizedCover(resp.Room.CoverArtURL, maxDataURLDetailBytes)
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // POST /api/rooms/{slug}/go-live

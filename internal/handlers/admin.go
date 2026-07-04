@@ -83,6 +83,9 @@ func (h *AdminHandler) ListRooms(w http.ResponseWriter, r *http.Request) {
 	counts := h.redis.GetListenerCounts(ctx, ids)
 	for i := range rooms {
 		rooms[i].ListenerCount = int(counts[rooms[i].ID])
+		// Blank oversized legacy data: covers on the wire slice (freshly fetched,
+		// not shared) so the admin list stays small like the public list.
+		rooms[i].CoverArtURL = stripOversizedCover(rooms[i].CoverArtURL, maxDataURLCoverBytes)
 	}
 
 	writeJSON(w, http.StatusOK, rooms)
@@ -113,6 +116,11 @@ func (h *AdminHandler) CreateOfficialRoom(w http.ResponseWriter, r *http.Request
 	}
 	if req.Name == "" {
 		http.Error(w, "name required", http.StatusBadRequest)
+		return
+	}
+
+	if err := validateCoverArt(req.CoverArt); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -319,6 +327,10 @@ func (h *AdminHandler) UpdateRoom(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if req.CoverArt != nil {
+		if err := validateCoverArt(*req.CoverArt); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		if err := h.pg.SetRoomCoverArt(ctx, roomID, *req.CoverArt); err != nil {
 			log.Printf("admin update cover art: %v", err)
 			http.Error(w, "failed to update cover art", http.StatusInternalServerError)
@@ -338,6 +350,7 @@ func (h *AdminHandler) UpdateRoom(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "updated"})
 		return
 	}
+	room.CoverArtURL = stripOversizedCover(room.CoverArtURL, maxDataURLDetailBytes)
 	writeJSON(w, http.StatusOK, room)
 }
 
@@ -350,6 +363,7 @@ func (h *AdminHandler) GetFeatured(w http.ResponseWriter, r *http.Request) {
 	if featured != nil {
 		count, _ := h.redis.GetListenerCount(ctx, featured.ID)
 		featured.ListenerCount = int(count)
+		featured.CoverArtURL = stripOversizedCover(featured.CoverArtURL, maxDataURLDetailBytes)
 		writeJSON(w, http.StatusOK, featured)
 		return
 	}
@@ -369,6 +383,7 @@ func (h *AdminHandler) GetFeatured(w http.ResponseWriter, r *http.Request) {
 			best = &rooms[i]
 		}
 	}
+	best.CoverArtURL = stripOversizedCover(best.CoverArtURL, maxDataURLDetailBytes)
 	writeJSON(w, http.StatusOK, best)
 }
 

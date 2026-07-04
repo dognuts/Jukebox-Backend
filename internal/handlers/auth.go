@@ -561,6 +561,11 @@ func (h *AuthHandler) GetMyFavorites(w http.ResponseWriter, r *http.Request) {
 	if favs == nil {
 		favs = []models.FavoriteRoom{}
 	}
+	// Blank oversized legacy data: covers on the wire slice so this list can't
+	// bloat a payload the frontend may embed server-side.
+	for i := range favs {
+		favs[i].CoverArtURL = stripOversizedCover(favs[i].CoverArtURL, maxDataURLCoverBytes)
+	}
 	writeJSON(w, http.StatusOK, favs)
 }
 
