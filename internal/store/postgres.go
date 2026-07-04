@@ -130,13 +130,18 @@ func (s *PGStore) RunMigrations(ctx context.Context, migrationsDir string) error
 		return fmt.Errorf("acquire migration lock: %w", err)
 	}
 	defer func() {
-		// Unlock on a fresh context so a canceled ctx can't strand the lock.
-		unlockCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		// Unlock AND restore the session's statement_timeout on a fresh
+		// context so a canceled ctx can't strand either. RESET returns the
+		// GUC to the pool's RuntimeParams value, so the session goes back
+		// to the pool with its server-side backstop intact. If any of it
+		// fails, close the session so neither the advisory lock nor the
+		// timeout exemption can leak into pooled traffic.
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if _, err := lockConn.Exec(unlockCtx, `SELECT pg_advisory_unlock($1)`, migrationLockKey); err != nil {
-			// Close the session so the lock dies with it rather than leaking
-			// into a pooled connection that outlives this run.
-			lockConn.Conn().Close(unlockCtx)
+		_, unlockErr := lockConn.Exec(cleanupCtx, `SELECT pg_advisory_unlock($1)`, migrationLockKey)
+		_, resetErr := lockConn.Exec(cleanupCtx, `RESET statement_timeout`)
+		if unlockErr != nil || resetErr != nil {
+			lockConn.Conn().Close(cleanupCtx)
 		}
 	}()
 

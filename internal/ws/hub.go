@@ -107,12 +107,14 @@ type Hub struct {
 	countMu sync.Mutex
 
 	// micState mirrors the last dj_mic_state broadcast (guarded by mu) so
-	// clients that join while the DJ's mic is already live receive the
-	// current state during sendInitialState instead of waiting for the
-	// next toggle.
+	// every joining client receives the current state during
+	// sendInitialState instead of waiting for the next toggle. micOwner is
+	// the connection that turned the mic on: only its departure clears the
+	// state (a DJ's second tab closing must not kill a live voice session).
 	micActive     bool
 	micPauseMusic bool
 	micDJName     string
+	micOwner      *Client
 
 	// persistCh feeds persistLoop, which inserts chat messages into
 	// Postgres in FIFO order after they have been broadcast.
@@ -375,14 +377,20 @@ func (h *Hub) onUnregister(client *Client) {
 		h.pg.EndListenEvent(ctx, evtID, 0)
 	}
 
-	// The publisher is gone: clear mic state and tell listeners, so their
-	// voice UI doesn't wait for a toggle that will never come and a future
-	// joiner doesn't get a stale mic replay.
+	// The mic's owning connection is gone: clear mic state and tell
+	// listeners, so their voice UI doesn't wait for a toggle that will
+	// never come and a future joiner doesn't get a stale mic replay.
+	// Scoped to the owner — a DJ's other tabs/devices leaving must not
+	// kill a voice session that is still live.
 	if client.IsDJ {
 		h.mu.Lock()
-		wasMicActive := h.micActive
-		h.micActive = false
-		h.micPauseMusic = false
+		ownsMic := h.micOwner == client
+		wasMicActive := h.micActive && ownsMic
+		if ownsMic {
+			h.micActive = false
+			h.micPauseMusic = false
+			h.micOwner = nil
+		}
 		h.mu.Unlock()
 		if wasMicActive {
 			h.broadcastJSON(WSMessage{
@@ -617,20 +625,20 @@ func (h *Hub) sendInitialState(client *Client) {
 		}})
 	}
 
-	// Replay the DJ's live mic state so a late joiner connects to voice
-	// immediately instead of waiting for the next toggle. Same event and
-	// payload shape as the ActionDJMic broadcast, so clients handle a
-	// replay and a live toggle identically.
+	// Replay the current mic state UNCONDITIONALLY — same event and payload
+	// shape as the ActionDJMic broadcast, so clients handle a replay and a
+	// live toggle identically. Active: a late joiner connects to voice
+	// immediately instead of waiting for the next toggle. Inactive: a
+	// RECONNECTING listener who missed the mic-off broadcast gets unstuck
+	// (their music would otherwise stay force-paused forever).
 	h.mu.RLock()
 	micActive, micPause, micDJ := h.micActive, h.micPauseMusic, h.micDJName
 	h.mu.RUnlock()
-	if micActive {
-		client.SendJSON(WSMessage{Event: EventDJMicState, Payload: map[string]interface{}{
-			"active":     true,
-			"pauseMusic": micPause,
-			"djName":     micDJ,
-		}})
-	}
+	client.SendJSON(WSMessage{Event: EventDJMicState, Payload: map[string]interface{}{
+		"active":     micActive,
+		"pauseMusic": micPause,
+		"djName":     micDJ,
+	}})
 
 	if client.IsDJ && len(pending) > 0 {
 		client.SendJSON(WSMessage{Event: EventRequestUpdate, Payload: pending})
@@ -1024,9 +1032,21 @@ func (h *Hub) handleInbound(cm *ClientMessage) {
 			return
 		}
 		h.mu.Lock()
+		if !h.Clients[client] {
+			// The sender disconnected while this action sat in the inbound
+			// queue; onUnregister has already settled mic state — a dead
+			// connection must not resurrect a mic nobody is holding.
+			h.mu.Unlock()
+			return
+		}
 		h.micActive = micPayload.Active
 		h.micPauseMusic = micPayload.PauseMusic
 		h.micDJName = client.DisplayName()
+		if micPayload.Active {
+			h.micOwner = client
+		} else {
+			h.micOwner = nil
+		}
 		h.mu.Unlock()
 		h.broadcastJSON(WSMessage{
 			Event: EventDJMicState,

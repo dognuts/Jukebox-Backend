@@ -718,3 +718,55 @@ func TestMicStateReplayedToLateJoinerAndClearedOnDJLeave(t *testing.T) {
 		}
 	}
 }
+
+// Mic state is owned by the connection that turned it on: another DJ
+// connection (second tab/device) leaving must not clear it or broadcast
+// mic-off, while the owner leaving must.
+func TestMicStateClearedOnlyByOwningConnection(t *testing.T) {
+	h := newTestHub(t, newFakeStore(testRoom(models.RequestPolicyOpen)))
+
+	djA := NewClient(h, nil, testSession("s-dj-a", "DJ Nova"))
+	djA.IsDJ = true
+	addClient(h, djA)
+	close(djA.registered)
+	djB := NewClient(h, nil, testSession("s-dj-b", "DJ Nova"))
+	djB.IsDJ = true
+	addClient(h, djB)
+	close(djB.registered)
+
+	payload, _ := json.Marshal(struct {
+		Active     bool `json:"active"`
+		PauseMusic bool `json:"pauseMusic"`
+	}{Active: true, PauseMusic: false})
+	select {
+	case h.Inbound <- &ClientMessage{Client: djA, Message: InboundMessage{Action: ActionDJMic, Payload: payload}}:
+	case <-time.After(time.Second):
+		t.Fatal("inbound channel blocked")
+	}
+	waitForMicState(t, djA, true, 2*time.Second)
+
+	// The non-owner tab leaves: mic must stay live.
+	select {
+	case h.Unregister <- djB:
+	case <-time.After(time.Second):
+		t.Fatal("unregister channel blocked")
+	}
+	// Give the unregister goroutine time to (wrongly) broadcast.
+	time.Sleep(100 * time.Millisecond)
+	late := NewClient(h, nil, testSession("s-late", "Late"))
+	addClient(h, late)
+	h.sendInitialState(late)
+	waitForMicState(t, late, true, 2*time.Second) // replay still active
+
+	// The owner leaves: now it clears, and joiners get the inactive replay.
+	select {
+	case h.Unregister <- djA:
+	case <-time.After(time.Second):
+		t.Fatal("unregister channel blocked")
+	}
+	waitForMicState(t, late, false, 2*time.Second)
+	late2 := NewClient(h, nil, testSession("s-late2", "Later"))
+	addClient(h, late2)
+	h.sendInitialState(late2)
+	waitForMicState(t, late2, false, 2*time.Second) // unconditional replay resyncs reconnectors
+}

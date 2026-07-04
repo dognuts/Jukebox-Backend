@@ -43,11 +43,19 @@ func main() {
 	}
 	defer pg.Close()
 
-	// Run migrations. A failure is fatal: booting without the expected
-	// schema fails later in stranger ways than a loud restart loop.
-	if err := pg.RunMigrations(ctx, "migrations"); err != nil {
+	// Run migrations under their own generous deadline, NOT the shared 10s
+	// boot ctx: a legitimately slow migration (index build on a grown table)
+	// or an advisory-lock wait behind a migrating peer would otherwise be
+	// killed client-side at 10s and, with the fatal exit below, turn every
+	// deploy that needs it into a crash loop.
+	// A failure is still fatal: booting without the expected schema fails
+	// later in stranger ways than a loud restart loop.
+	migCtx, migCancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	if err := pg.RunMigrations(migCtx, "migrations"); err != nil {
+		migCancel()
 		log.Fatalf("migrations: %v", err)
 	}
+	migCancel()
 
 	redis, err := store.NewRedisStore(cfg.RedisURL, cfg.SessionTTL)
 	if err != nil {
