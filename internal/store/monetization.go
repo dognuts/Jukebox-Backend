@@ -30,6 +30,21 @@ func (s *PGStore) ActivatePlus(ctx context.Context, userID string, periodEnd tim
 	return err
 }
 
+// AdminSetPlus grants or revokes Plus directly (admin panel). Granting
+// clears plus_expires_at — NULL means "indefinite, admin-granted" under
+// the derived is_plus expression — so a stale expiry from an old
+// subscription can't silently nullify the grant.
+func (s *PGStore) AdminSetPlus(ctx context.Context, userID string, isPlus bool) error {
+	if isPlus {
+		_, err := s.pool.Exec(ctx,
+			`UPDATE users SET is_plus = true, plus_expires_at = NULL, plus_since = COALESCE(plus_since, NOW()), updated_at = NOW() WHERE id = $1`, userID)
+		return err
+	}
+	_, err := s.pool.Exec(ctx,
+		`UPDATE users SET is_plus = false, updated_at = NOW() WHERE id = $1`, userID)
+	return err
+}
+
 func (s *PGStore) DeactivatePlus(ctx context.Context, userID string) error {
 	_, err := s.pool.Exec(ctx, `UPDATE users SET is_plus = false, updated_at = NOW() WHERE id = $1`, userID)
 	if err != nil {
@@ -174,12 +189,58 @@ func (s *PGStore) GetNeonTube(ctx context.Context, roomID string) (*models.NeonT
 	return tube, err
 }
 
-func (s *PGStore) LevelUpTube(ctx context.Context, roomID string, newLevel int, newFillTarget int, overflow int) error {
-	_, err := s.pool.Exec(ctx, `
-		UPDATE neon_tubes SET level = $2, fill_amount = $4, fill_target = $3, updated_at = NOW()
-		WHERE room_id = $1`,
-		roomID, newLevel, newFillTarget, overflow)
-	return err
+// ResolveTubeOverflow atomically applies any pending level-ups to a room's
+// tube. The row is locked FOR UPDATE for the duration, so two concurrent
+// tips that both push the tube past its target can't each level it up from
+// the same stale snapshot (the old read-modify-write in the handler did
+// exactly that, dropping one tip's fill). Returns the settled tube state
+// and whether at least one level-up happened.
+func (s *PGStore) ResolveTubeOverflow(ctx context.Context, roomID string, levelTargets map[int]int, maxLevel int) (*models.NeonTube, bool, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	defer tx.Rollback(ctx)
+
+	tube := &models.NeonTube{}
+	err = tx.QueryRow(ctx, `
+		SELECT room_id, level, fill_amount, fill_target, total_neon, updated_at
+		FROM neon_tubes WHERE room_id = $1 FOR UPDATE`, roomID).
+		Scan(&tube.RoomID, &tube.Level, &tube.FillAmount, &tube.FillTarget, &tube.TotalNeon, &tube.UpdatedAt)
+	if err == pgx.ErrNoRows {
+		return &models.NeonTube{RoomID: roomID, Level: 1, FillAmount: 0, FillTarget: 100, TotalNeon: 0}, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+
+	leveled := false
+	for tube.FillTarget > 0 && tube.FillAmount >= tube.FillTarget {
+		overflow := tube.FillAmount - tube.FillTarget
+		next := tube.Level + 1
+		if next > maxLevel {
+			next = 1 // loop back
+		}
+		target, ok := levelTargets[next]
+		if !ok || target <= 0 {
+			target = 100
+		}
+		tube.Level, tube.FillAmount, tube.FillTarget = next, overflow, target
+		leveled = true
+	}
+
+	if leveled {
+		if _, err := tx.Exec(ctx, `
+			UPDATE neon_tubes SET level = $2, fill_amount = $3, fill_target = $4, updated_at = NOW()
+			WHERE room_id = $1`,
+			roomID, tube.Level, tube.FillAmount, tube.FillTarget); err != nil {
+			return nil, false, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, false, err
+	}
+	return tube, leveled, nil
 }
 
 // ---------- Creator Pool ----------
@@ -201,19 +262,35 @@ func (s *PGStore) ComputeCreatorPool(ctx context.Context, month string, poolPct 
 
 	poolAmount := totalRevenue * poolPct / 100
 
-	// Get Plus listening minutes per creator for the month
-	// Only count minutes from users who were Plus during that period
+	// Get Plus listening minutes per creator for the month.
+	// Anti-abuse hardening baked into the query:
+	//   - keyed on rooms.creator_user_id (a real users.id, matching the
+	//     allocations FK) — never the anonymous dj_session_id
+	//   - self-listens excluded: minutes a creator spends in their own
+	//     rooms (including parked idle connections) earn nothing
+	//   - only currently-valid Plus counts (expiry enforced, not just the
+	//     is_plus flag)
+	//   - each (listener, creator) pair is capped at 3000 min/month
+	//     (~100 min/day) so one parked Plus account can't carry a creator
 	rows, err := s.pool.Query(ctx, `
-		SELECT r.dj_session_id, COALESCE(SUM(le.duration_seconds)/60, 0) as minutes
-		FROM listen_events le
-		JOIN rooms r ON r.id = le.room_id
-		JOIN users u ON u.id = le.user_id
-		WHERE u.is_plus = true
-		AND le.started_at >= ($1 || '-01')::date
-		AND le.started_at < ($1 || '-01')::date + INTERVAL '1 month'
-		AND le.duration_seconds > 0
-		GROUP BY r.dj_session_id
-		HAVING SUM(le.duration_seconds) > 0
+		SELECT creator, SUM(LEAST(pair_minutes, 3000))::bigint AS minutes
+		FROM (
+			SELECT r.creator_user_id AS creator, le.user_id,
+				COALESCE(SUM(le.duration_seconds)/60, 0) AS pair_minutes
+			FROM listen_events le
+			JOIN rooms r ON r.id = le.room_id
+			JOIN users u ON u.id = le.user_id
+			WHERE u.is_plus = true
+			AND (u.plus_expires_at IS NULL OR u.plus_expires_at > NOW())
+			AND r.creator_user_id <> ''
+			AND le.user_id <> r.creator_user_id
+			AND le.started_at >= ($1 || '-01')::date
+			AND le.started_at < ($1 || '-01')::date + INTERVAL '1 month'
+			AND le.duration_seconds > 0
+			GROUP BY r.creator_user_id, le.user_id
+		) pair
+		GROUP BY creator
+		HAVING SUM(LEAST(pair_minutes, 3000)) > 0
 		ORDER BY minutes DESC`, month)
 	if err != nil {
 		return nil, nil, err

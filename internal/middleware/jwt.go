@@ -107,7 +107,11 @@ func AuthMiddleware(secret string, pg *store.PGStore) func(http.Handler) http.Ha
 							putCachedUser(claims.UserID, user)
 						}
 					}
-					if user != nil {
+					// Banned accounts get no identity: their still-valid JWTs
+					// no longer authenticate anything. (Login and refresh
+					// reject them outright, so this also bounds how long an
+					// existing token keeps working to the cache TTL.)
+					if user != nil && !user.IsBanned {
 						ctx = context.WithValue(ctx, UserKey, user)
 					}
 				}

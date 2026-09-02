@@ -30,6 +30,11 @@ type Config struct {
 	TurnstileSecretKey string
 	SentryDSN          string
 	YouTubeDataAPIKey  string
+	// DevPayments enables the no-Stripe instant-activation billing stubs.
+	// Explicit opt-in (DEV_PAYMENTS=true) rather than inferred from ENV:
+	// ENV defaults to "development" when unset, so keying free purchases
+	// off it would FAIL OPEN on any deploy that forgot to set ENV.
+	DevPayments bool
 }
 
 func Load() *Config {
@@ -63,6 +68,7 @@ func Load() *Config {
 		TurnstileSecretKey: getEnv("TURNSTILE_SECRET_KEY", ""),
 		SentryDSN:          getEnv("SENTRY_DSN", ""),
 		YouTubeDataAPIKey:  getEnv("YOUTUBE_DATA_API_KEY", ""),
+		DevPayments:        getEnv("DEV_PAYMENTS", "") == "true",
 	}
 }
 

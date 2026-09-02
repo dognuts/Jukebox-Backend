@@ -7,17 +7,19 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/jukebox/backend/internal/antispam"
 	"github.com/jukebox/backend/internal/middleware"
 	"github.com/jukebox/backend/internal/models"
 	"github.com/jukebox/backend/internal/store"
 )
 
 type MessageHandler struct {
-	pg *store.PGStore
+	pg      *store.PGStore
+	limiter *antispam.RateLimiter
 }
 
-func NewMessageHandler(pg *store.PGStore) *MessageHandler {
-	return &MessageHandler{pg: pg}
+func NewMessageHandler(pg *store.PGStore, limiter *antispam.RateLimiter) *MessageHandler {
+	return &MessageHandler{pg: pg, limiter: limiter}
 }
 
 // GET /api/messages — list all conversations
@@ -74,6 +76,22 @@ func (h *MessageHandler) SendMessage(w http.ResponseWriter, r *http.Request) {
 	if user == nil {
 		http.Error(w, "authentication required", http.StatusUnauthorized)
 		return
+	}
+
+	// DMs require a verified account, matching the chat/room-creation gate
+	// — this was the one participation surface the gate missed.
+	if !user.EmailVerified {
+		http.Error(w, "verify your email address to send messages", http.StatusForbidden)
+		return
+	}
+
+	// Per-sender rate limit: DMs had none, making them the cheapest spam
+	// channel for a fresh account.
+	if h.limiter != nil {
+		if allowed, _ := h.limiter.AllowDM(r.Context(), user.ID); !allowed {
+			http.Error(w, "you're sending messages too fast — please slow down", http.StatusTooManyRequests)
+			return
+		}
 	}
 
 	toUserID := chi.URLParam(r, "userId")

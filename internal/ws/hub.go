@@ -13,6 +13,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/jukebox/backend/internal/middleware"
 	"github.com/jukebox/backend/internal/models"
+	"github.com/jukebox/backend/internal/moderation"
 	"github.com/jukebox/backend/internal/store"
 )
 
@@ -32,7 +33,8 @@ type dataStore interface {
 	GetQueue(ctx context.Context, roomID string) ([]models.QueueEntry, error)
 	GetPendingRequests(ctx context.Context, roomID string) ([]models.QueueEntry, error)
 	AddToQueue(ctx context.Context, entry *models.QueueEntry) error
-	UpdateQueueEntryStatus(ctx context.Context, entryID string, status models.QueueEntryStatus) error
+	UpdateQueueEntryStatus(ctx context.Context, roomID, entryID string, status models.QueueEntryStatus) error
+	CountActiveQueueEntriesBySession(ctx context.Context, roomID, sessionID string) (int, error)
 	PopNextTrack(ctx context.Context, roomID string) (*models.QueueEntry, error)
 	SetNowPlaying(ctx context.Context, roomID, trackID string) error
 	ClearNowPlaying(ctx context.Context, roomID string) error
@@ -685,6 +687,12 @@ func (h *Hub) handleInbound(cm *ClientMessage) {
 			client.sendError("message too long (max 500 chars)")
 			return
 		}
+		// Server-side moderation — the client-side filter is trivially
+		// bypassed by anyone speaking the WS protocol directly.
+		if moderation.ContainsProfanity(p.Message) {
+			client.sendError("message contains prohibited language")
+			return
+		}
 
 		// Validate media URL if present — only allow GIPHY domains
 		var mediaURL, mediaType string
@@ -755,6 +763,17 @@ func (h *Hub) handleInbound(cm *ClientMessage) {
 		if err := json.Unmarshal(msg.Payload, &p); err != nil || p.Emoji == "" {
 			return // silently ignore invalid reactions
 		}
+		// Cap the payload and rate — each reaction fans out to every
+		// listener, so an unlimited ~4KB "emoji" is a 1-to-N broadcast
+		// amplifier that evicts real chat/playback events from the buffer.
+		if len([]rune(p.Emoji)) > 16 {
+			return
+		}
+		now := time.Now()
+		if now.Sub(client.LastReaction) < 300*time.Millisecond {
+			return // silently drop; reactions are fire-and-forget
+		}
+		client.LastReaction = now
 		// Broadcast to all clients in the room (including sender)
 		h.broadcastJSON(WSMessage{Event: EventReaction, Payload: map[string]string{
 			"emoji":    p.Emoji,
@@ -766,6 +785,33 @@ func (h *Hub) handleInbound(cm *ClientMessage) {
 		if err := json.Unmarshal(msg.Payload, &p); err != nil {
 			client.rejectSubmit("invalid track submission")
 			return
+		}
+
+		// Field caps + source/host allowlist (see models.ValidateTrackSubmission).
+		if err := models.ValidateTrackSubmission(p.Title, p.Artist, p.Source, p.SourceURL, p.Duration, client.IsDJ); err != nil {
+			client.rejectSubmit(err.Error())
+			return
+		}
+		if moderation.ContainsProfanity(p.Title) || moderation.ContainsProfanity(p.Artist) {
+			client.rejectSubmit("track title contains prohibited language")
+			return
+		}
+
+		// Rate limit + per-submitter queue cap for non-DJs: submissions
+		// insert DB rows and rebroadcast the whole queue to every client,
+		// so an unthrottled loop is an O(n²) flood. The cooldown stamp
+		// lands only after the checks pass — a rejection (cap reached,
+		// requests closed) must not also charge the 5s cooldown.
+		if !client.IsDJ {
+			if time.Since(client.LastSubmit) < 5*time.Second {
+				client.rejectSubmit("you're submitting too fast — wait a few seconds")
+				return
+			}
+			if n, err := h.pg.CountActiveQueueEntriesBySession(ctx, h.RoomID, client.Session.ID); err == nil && n >= 10 {
+				client.rejectSubmit("you already have 10 tracks waiting — let some play first")
+				return
+			}
+			client.LastSubmit = time.Now()
 		}
 
 		// Get room to check policy
@@ -878,7 +924,7 @@ func (h *Hub) handleInbound(cm *ClientMessage) {
 			client.sendError("invalid payload")
 			return
 		}
-		if err := h.pg.UpdateQueueEntryStatus(ctx, p.EntryID, models.QueueApproved); err != nil {
+		if err := h.pg.UpdateQueueEntryStatus(ctx, h.RoomID, p.EntryID, models.QueueApproved); err != nil {
 			log.Printf("approve entry: %v", err)
 			return
 		}
@@ -895,7 +941,7 @@ func (h *Hub) handleInbound(cm *ClientMessage) {
 			client.sendError("invalid payload")
 			return
 		}
-		h.pg.UpdateQueueEntryStatus(ctx, p.EntryID, models.QueueRejected)
+		h.pg.UpdateQueueEntryStatus(ctx, h.RoomID, p.EntryID, models.QueueRejected)
 
 	case ActionDJSetPolicy:
 		if !client.IsDJ {
@@ -1071,6 +1117,14 @@ func (h *Hub) handleInbound(cm *ClientMessage) {
 		})
 
 	case ActionReportDuration:
+		// Per-client throttle: each report spawns a goroutine doing
+		// Postgres + Redis lookups server-side, so a frame loop would be
+		// cheap amplification even though the reports themselves are
+		// verified downstream.
+		if time.Since(client.LastPlaybackReport) < 2*time.Second {
+			return
+		}
+		client.LastPlaybackReport = time.Now()
 		var durPayload struct {
 			TrackID  string `json:"trackId"`
 			Duration int    `json:"duration"`
@@ -1082,9 +1136,13 @@ func (h *Hub) handleInbound(cm *ClientMessage) {
 		}
 
 	case ActionAutoplayEnd:
-		// Any listener can report that the autoplay track ended.
-		// The advanceTrack debounce prevents double-advances, but we avoid
-		// spawning a goroutine for every listener's report in a burst.
+		// Any listener can report that the autoplay track ended; the
+		// playback service verifies elapsed time server-side. Same
+		// per-client throttle as report_duration.
+		if time.Since(client.LastPlaybackReport) < 2*time.Second {
+			return
+		}
+		client.LastPlaybackReport = time.Now()
 		if h.OnAutoplayEnd != nil {
 			go h.OnAutoplayEnd(h.RoomID)
 		}
@@ -1193,11 +1251,13 @@ func (h *Hub) broadcastListenerCount(count int) {
 
 func (h *Hub) broadcastListenerList() {
 	h.mu.RLock()
+	// Deliberately no user IDs here: the list goes to every client in the
+	// room (anonymous ones included), and broadcasting account IDs handed
+	// spammers a ready-made target list for DMs.
 	type listenerInfo struct {
 		Username    string `json:"username"`
 		AvatarColor string `json:"avatarColor"`
 		IsDJ        bool   `json:"isDJ"`
-		UserID      string `json:"userId,omitempty"`
 	}
 	var listeners []listenerInfo
 	seen := map[string]bool{}
@@ -1211,11 +1271,24 @@ func (h *Hub) broadcastListenerList() {
 			Username:    name,
 			AvatarColor: client.Session.AvatarColor,
 			IsDJ:        client.IsDJ,
-			UserID:      client.UserID,
 		})
 	}
 	h.mu.RUnlock()
 	h.broadcastJSON(WSMessage{Event: EventListenerList, Payload: listeners})
+}
+
+// SessionClientCount reports how many current clients belong to the given
+// session — the basis of the per-session connection cap.
+func (h *Hub) SessionClientCount(sessionID string) int {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	n := 0
+	for client := range h.Clients {
+		if client.Session != nil && client.Session.ID == sessionID {
+			n++
+		}
+	}
+	return n
 }
 
 func (h *Hub) notifyDJs(msg WSMessage) {

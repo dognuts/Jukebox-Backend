@@ -44,6 +44,9 @@ type Client struct {
 	User     *models.User // full user record if authenticated
 	IsDJ     bool
 	LastChat time.Time // rate limit chat messages
+	LastReaction time.Time // rate limit reactions
+	LastSubmit   time.Time // rate limit track submissions
+	LastPlaybackReport time.Time // rate limit report_duration / autoplay_track_ended
 
 	// done is closed (via close) when the hub drops the client — a
 	// normal unregister or a slow-client eviction. Send itself is never
@@ -71,6 +74,13 @@ func NewClient(hub *Hub, conn *websocket.Conn, session *models.Session) *Client 
 		done:       make(chan struct{}),
 		registered: make(chan struct{}),
 	}
+}
+
+// Done exposes the client's lifecycle channel: closed when the hub drops
+// the client. Lets the connection handler tie external bookkeeping (per-IP
+// connection slots) to the client's actual lifetime.
+func (c *Client) Done() <-chan struct{} {
+	return c.done
 }
 
 // close marks the client as dropped, waking its WritePump. Idempotent and

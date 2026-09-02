@@ -9,11 +9,14 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/jukebox/backend/internal/antispam"
 	"github.com/jukebox/backend/internal/middleware"
 	"github.com/jukebox/backend/internal/models"
+	"github.com/jukebox/backend/internal/moderation"
 	"github.com/jukebox/backend/internal/playback"
 	"github.com/jukebox/backend/internal/store"
 	"github.com/jukebox/backend/internal/ws"
@@ -25,10 +28,11 @@ type RoomHandler struct {
 	hubs      *ws.HubManager
 	playback  *playback.SyncService
 	listCache *payloadCache
+	limiter   *antispam.RateLimiter
 }
 
-func NewRoomHandler(pg *store.PGStore, redis *store.RedisStore, hubs *ws.HubManager, pb *playback.SyncService) *RoomHandler {
-	return &RoomHandler{pg: pg, redis: redis, hubs: hubs, playback: pb, listCache: newPayloadCache(roomsListCacheTTL)}
+func NewRoomHandler(pg *store.PGStore, redis *store.RedisStore, hubs *ws.HubManager, pb *playback.SyncService, limiter *antispam.RateLimiter) *RoomHandler {
+	return &RoomHandler{pg: pg, redis: redis, hubs: hubs, playback: pb, listCache: newPayloadCache(roomsListCacheTTL), limiter: limiter}
 }
 
 var slugRe = regexp.MustCompile(`[^a-z0-9]+`)
@@ -74,10 +78,49 @@ func (h *RoomHandler) Create(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "name is required", http.StatusBadRequest)
 		return
 	}
+	// Rune counts, not bytes — the frontend's maxLength counts characters,
+	// and emoji/accented names must not be rejected server-side.
+	if utf8.RuneCountInString(req.Name) > 40 {
+		http.Error(w, "name must be 40 characters or less", http.StatusBadRequest)
+		return
+	}
+	if utf8.RuneCountInString(req.Description) > 500 {
+		http.Error(w, "description must be 500 characters or less", http.StatusBadRequest)
+		return
+	}
+
+	// Server-side moderation — the client-side filter on /create is
+	// trivially bypassed by posting to this endpoint directly, and room
+	// names/descriptions render on the public discovery pages.
+	if moderation.ContainsProfanity(req.Name) || moderation.ContainsProfanity(req.Description) {
+		http.Error(w, "room name or description contains prohibited language", http.StatusBadRequest)
+		return
+	}
 
 	if err := validateCoverArt(req.CoverArt); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
+	}
+
+	// The gradient is rendered verbatim into other users' inline styles —
+	// vet it so it can't smuggle url(...) beacons onto the homepage.
+	if err := validateCSSValue(req.CoverGradient, 300); err != nil {
+		http.Error(w, "invalid cover gradient", http.StatusBadRequest)
+		return
+	}
+
+	// Cap concurrent rooms per creator and creation rate: rooms embed
+	// their covers into the unpaginated public list payload, so unbounded
+	// creation was a site-wide amplification vector.
+	if n, err := h.pg.CountActiveRoomsByCreator(r.Context(), user.ID); err == nil && n >= 5 {
+		http.Error(w, "you already have 5 open jukeboxes — end one before creating another", http.StatusTooManyRequests)
+		return
+	}
+	if h.limiter != nil {
+		if allowed, _ := h.limiter.AllowRoomCreate(r.Context(), user.ID); !allowed {
+			http.Error(w, "you're creating jukeboxes too fast — please slow down", http.StatusTooManyRequests)
+			return
+		}
 	}
 
 	// Generate DJ key
@@ -149,16 +192,16 @@ func (h *RoomHandler) Create(w http.ResponseWriter, r *http.Request) {
 
 	// Pre-load queue from a user tracklist if provided
 	if req.PlaylistID != "" && user != nil {
-		log.Printf("[room] attempting to pre-load playlist %s for room %s", req.PlaylistID, room.Slug)
+		log.Printf("[room] attempting to pre-load playlist %s for room %s", sanitizeLogValue(req.PlaylistID), room.Slug)
 		pl, err := h.pg.GetPlaylistWithTracks(r.Context(), req.PlaylistID)
 		if err != nil {
-			log.Printf("[room] failed to fetch playlist %s: %v", req.PlaylistID, err)
+			log.Printf("[room] failed to fetch playlist %s: %v", sanitizeLogValue(req.PlaylistID), err)
 		} else if pl == nil {
-			log.Printf("[room] playlist %s not found", req.PlaylistID)
+			log.Printf("[room] playlist %s not found", sanitizeLogValue(req.PlaylistID))
 		} else if pl.UserID != user.ID {
-			log.Printf("[room] playlist %s belongs to %s, not %s", req.PlaylistID, pl.UserID, user.ID)
+			log.Printf("[room] playlist %s belongs to %s, not %s", sanitizeLogValue(req.PlaylistID), pl.UserID, user.ID)
 		} else if len(pl.Tracks) == 0 {
-			log.Printf("[room] playlist %s has no tracks", req.PlaylistID)
+			log.Printf("[room] playlist %s has no tracks", sanitizeLogValue(req.PlaylistID))
 		} else {
 			now := time.Now()
 			tracks := make([]*models.Track, len(pl.Tracks))
@@ -195,7 +238,7 @@ func (h *RoomHandler) Create(w http.ResponseWriter, r *http.Request) {
 			} else if err := h.pg.AddTracksToQueue(r.Context(), room.ID, entries); err != nil {
 				log.Printf("[room] pre-load: failed to queue %d tracks: %v", len(entries), err)
 			} else {
-				log.Printf("[room] pre-loaded %d/%d tracks from playlist '%s' into room %s", len(entries), len(pl.Tracks), pl.Name, room.Slug)
+				log.Printf("[room] pre-loaded %d/%d tracks from playlist '%s' into room %s", len(entries), len(pl.Tracks), sanitizeLogValue(pl.Name), room.Slug)
 			}
 		}
 	}

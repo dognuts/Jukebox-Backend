@@ -63,6 +63,52 @@ func (r *RedisStore) Client() *redis.Client {
 	return r.client
 }
 
+// ==================== WebSocket tickets ====================
+
+// WSTicket is the short-lived, single-use credential that authenticates a
+// WebSocket connection. Minted over an authenticated POST (headers carry
+// the session/JWT/DJ key), redeemed once from the ws URL — so no reusable
+// bearer credential ever appears in a URL or a request log.
+type WSTicket struct {
+	SessionID string `json:"sessionId"`
+	UserID    string `json:"userId,omitempty"`
+	RoomID    string `json:"roomId"`
+	IsDJ      bool   `json:"isDJ"`
+}
+
+const wsTicketTTL = 30 * time.Second
+
+// CreateWSTicket stores a ticket under a random id with a 30s TTL and
+// returns the id.
+func (r *RedisStore) CreateWSTicket(ctx context.Context, t *WSTicket) (string, error) {
+	id := uuid.New().String()
+	data, err := json.Marshal(t)
+	if err != nil {
+		return "", err
+	}
+	if err := r.client.Set(ctx, "wsticket:"+id, data, wsTicketTTL).Err(); err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+// RedeemWSTicket atomically fetches and deletes a ticket (single use).
+// Returns nil if the ticket is unknown, expired, or already redeemed.
+func (r *RedisStore) RedeemWSTicket(ctx context.Context, id string) (*WSTicket, error) {
+	data, err := r.client.GetDel(ctx, "wsticket:"+id).Bytes()
+	if err == redis.Nil {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	t := &WSTicket{}
+	if err := json.Unmarshal(data, t); err != nil {
+		return nil, err
+	}
+	return t, nil
+}
+
 // ==================== Sessions ====================
 
 func (r *RedisStore) CreateSession(ctx context.Context) (*models.Session, error) {

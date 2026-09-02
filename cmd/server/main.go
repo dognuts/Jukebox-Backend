@@ -48,6 +48,16 @@ func hostnamesFromURLs(urls []string) []string {
 func main() {
 	cfg := config.Load()
 
+	// Refuse to boot with a forgeable JWT secret. The config default is a
+	// public string in an open repo — with it live, anyone can sign an
+	// HS256 token for any user id (including the admin) and the server
+	// will honor it. Unconditional, not ENV-gated: a prod deploy that
+	// forgot to set ENV would skip an ENV-gated check exactly where it
+	// matters.
+	if cfg.JWTSecret == "change-me-in-production-please" || cfg.JWTSecret == "change-me-to-a-random-64-char-string" || len(cfg.JWTSecret) < 32 {
+		log.Fatal("FATAL: JWT_SECRET is unset, a known placeholder, or shorter than 32 characters. Set a strong random JWT_SECRET (e.g. `openssl rand -hex 32`) and restart.")
+	}
+
 	// ---------- Error monitoring ----------
 	if err := middleware.InitSentry(cfg.SentryDSN, cfg.Env); err != nil {
 		log.Printf("sentry warning: %v", err)
@@ -136,12 +146,13 @@ func main() {
 
 	// ---------- Handlers ----------
 
-	roomH := handlers.NewRoomHandler(pg, redis, hubMgr, syncSvc)
-	queueH := handlers.NewQueueHandler(pg, redis, hubMgr)
-	sessionH := handlers.NewSessionHandler(redis)
+	roomH := handlers.NewRoomHandler(pg, redis, hubMgr, syncSvc, signupLimiter)
+	queueH := handlers.NewQueueHandler(pg, redis, hubMgr, signupLimiter)
+	sessionH := handlers.NewSessionHandler(redis, signupLimiter)
 	wsH := handlers.NewWSHandler(pg, redis, hubMgr, cfg.JWTSecret, cfg.CORSOrigins)
+	wsTicketH := handlers.NewWSTicketHandler(pg, redis, signupLimiter)
 	authH := handlers.NewAuthHandler(pg, redis, emailSvc, cfg.JWTSecret, cfg.TurnstileSecretKey, turnstileHosts, signupLimiter)
-	msgH := handlers.NewMessageHandler(pg)
+	msgH := handlers.NewMessageHandler(pg, signupLimiter)
 	plH := handlers.NewPlaylistHandler(pg)
 	djH := handlers.NewDJHandler(pg)
 	// YouTube search client is optional: nil when YOUTUBE_DATA_API_KEY is unset,
@@ -151,9 +162,17 @@ func main() {
 		ytClient = youtube.NewClient(cfg.YouTubeDataAPIKey)
 	}
 	adminH := handlers.NewAdminHandler(pg, redis, hubMgr, syncSvc, ytClient)
-	monH := handlers.NewMonetizationHandler(pg, hubMgr)
+	// Purchases only activate for free when DEV_PAYMENTS=true is set
+	// explicitly (local development). Everywhere else they return 503
+	// until real (Stripe-webhook-verified) payments exist. Deliberately
+	// NOT keyed on ENV, whose default is "development" — that would fail
+	// open on a deploy that forgot to set it.
+	if cfg.DevPayments {
+		log.Println("⚠️  DEV_PAYMENTS=true — billing endpoints grant Plus/Neon/DJ subs WITHOUT payment. Never set this in production.")
+	}
+	monH := handlers.NewMonetizationHandler(pg, hubMgr, cfg.DevPayments)
 	supportH := handlers.NewSupportHandler(pg, signupLimiter, emailSvc)
-	lkH := handlers.NewLiveKitHandler(cfg)
+	lkH := handlers.NewLiveKitHandler(cfg, pg)
 
 	// ---------- Router ----------
 
@@ -173,8 +192,33 @@ func main() {
 	// Security headers
 	r.Use(middleware.SecurityHeaders(cfg.CORSOrigins))
 
-	// Limit request body size to 10MB (covers cover art uploads)
-	r.Use(middleware.MaxBodySize(10 * 1024 * 1024))
+	// Route-aware body caps: cover-art-bearing endpoints get megabytes;
+	// everything else — including the unauthenticated auth endpoints —
+	// gets 64KB, so a flood of fat JSON bodies can't buy cheap memory
+	// pressure against login/refresh/forgot-password.
+	r.Use(func(next http.Handler) http.Handler {
+		const (
+			smallBody  = 64 * 1024
+			mediumBody = 1024 * 1024
+			largeBody  = 10 * 1024 * 1024 // cover art data URLs
+		)
+		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			limit := int64(smallBody)
+			p := req.URL.Path
+			switch {
+			case req.Method == http.MethodPost && p == "/api/rooms",
+				strings.HasPrefix(p, "/api/admin/rooms"),
+				strings.HasPrefix(p, "/api/admin/autoplay"):
+				limit = largeBody
+			case strings.HasPrefix(p, "/api/playlists"):
+				limit = mediumBody
+			}
+			if req.Body != nil {
+				req.Body = http.MaxBytesReader(w, req.Body, limit)
+			}
+			next.ServeHTTP(w, req)
+		})
+	})
 
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins:   cfg.CORSOrigins,
@@ -183,6 +227,13 @@ func main() {
 		AllowCredentials: true,
 		MaxAge:           300,
 	}))
+
+	// CSRF backstop for the cross-site session cookie: mutating JSON
+	// endpoints only accept bodies declared as application/json, which a
+	// hostile page's form post cannot produce without a CORS preflight.
+	// AFTER the CORS handler so its 415 responses carry CORS headers and
+	// OPTIONS preflights are answered first.
+	r.Use(middleware.RequireJSONContentType)
 
 	// Session middleware (anonymous identity)
 	r.Use(middleware.SessionMiddleware(redis))
@@ -311,6 +362,10 @@ func main() {
 
 		// LiveKit voice
 		r.Post("/livekit/token", lkH.GetToken)
+
+		// WebSocket tickets: single-use, 30s credentials so the ws URL
+		// never carries a JWT / DJ key / session id into request logs.
+		r.Post("/ws/ticket", wsTicketH.Create)
 	})
 
 	// WebSocket
@@ -324,6 +379,10 @@ func main() {
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 15 * time.Second,
 		IdleTimeout:  60 * time.Second,
+		// Defense in depth for header-based floods (e.g. megabyte bearer
+		// tokens parsed before signature checks): nothing legitimate sends
+		// more than a few KB of headers.
+		MaxHeaderBytes: 16 * 1024,
 	}
 
 	// Graceful shutdown

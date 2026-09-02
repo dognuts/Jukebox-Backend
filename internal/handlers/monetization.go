@@ -16,16 +16,34 @@ import (
 type MonetizationHandler struct {
 	pg   *store.PGStore
 	hubs *ws.HubManager
+	// devPayments allows the no-Stripe instant-activation stubs. It must
+	// only ever be true in local development: in production these paths
+	// hand out Plus subscriptions, DJ subs, and Neon currency for free.
+	devPayments bool
 }
 
-func NewMonetizationHandler(pg *store.PGStore, hubs *ws.HubManager) *MonetizationHandler {
-	return &MonetizationHandler{pg: pg, hubs: hubs}
+func NewMonetizationHandler(pg *store.PGStore, hubs *ws.HubManager, devPayments bool) *MonetizationHandler {
+	return &MonetizationHandler{pg: pg, hubs: hubs, devPayments: devPayments}
+}
+
+// requirePayments gates the purchase endpoints until real payment
+// processing (Stripe webhook-driven activation) exists. Returns false —
+// having written the response — when purchases must be refused.
+func (h *MonetizationHandler) requirePayments(w http.ResponseWriter) bool {
+	if h.devPayments {
+		return true
+	}
+	http.Error(w, "purchases are not available yet", http.StatusServiceUnavailable)
+	return false
 }
 
 // ============ Plus ============
 
 // POST /api/billing/plus/subscribe (dev mode: instant activation)
 func (h *MonetizationHandler) SubscribePlus(w http.ResponseWriter, r *http.Request) {
+	if !h.requirePayments(w) {
+		return
+	}
 	user := middleware.GetUser(r.Context())
 	if user == nil {
 		http.Error(w, "login required", http.StatusUnauthorized)
@@ -139,6 +157,9 @@ func (h *MonetizationHandler) UpdateDJSubSettings(w http.ResponseWriter, r *http
 
 // POST /api/billing/dj/{userId}/subscribe (dev mode)
 func (h *MonetizationHandler) SubscribeToDJ(w http.ResponseWriter, r *http.Request) {
+	if !h.requirePayments(w) {
+		return
+	}
 	user := middleware.GetUser(r.Context())
 	if user == nil {
 		http.Error(w, "login required", http.StatusUnauthorized)
@@ -202,6 +223,9 @@ func (h *MonetizationHandler) GetNeonPacks(w http.ResponseWriter, r *http.Reques
 
 // POST /api/billing/neon/buy (dev mode: instant credit)
 func (h *MonetizationHandler) BuyNeon(w http.ResponseWriter, r *http.Request) {
+	if !h.requirePayments(w) {
+		return
+	}
 	user := middleware.GetUser(r.Context())
 	if user == nil {
 		http.Error(w, "login required", http.StatusUnauthorized)
@@ -279,6 +303,13 @@ func (h *MonetizationHandler) SendNeon(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Tips into your own room would let minted/self-owned currency be
+	// laundered into "DJ earnings" metrics — disallow.
+	if room.CreatorUserID != "" && room.CreatorUserID == user.ID {
+		http.Error(w, "you cannot send neon to your own room", http.StatusBadRequest)
+		return
+	}
+
 	// Find DJ user ID (from session creator)
 	var djUserID *string
 	// Room's DJSessionID is the session, but we need the user.
@@ -290,34 +321,20 @@ func (h *MonetizationHandler) SendNeon(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		log.Printf("[neon] SpendNeon error for user=%s room=%s amount=%d: %v", user.ID, req.RoomID, req.Amount, err)
-		http.Error(w, "failed to send neon: "+err.Error(), http.StatusInternalServerError)
+		http.Error(w, "failed to send neon", http.StatusInternalServerError)
 		return
 	}
 
-	// Get updated tube state
-	tube, _ := h.pg.GetNeonTube(r.Context(), req.RoomID)
-
-	// Check if power-up triggered (tube overflowed)
-	var poweredUp bool
-	if tube != nil && tube.FillAmount >= tube.FillTarget {
-		poweredUp = true
-		// Level up
-		overflow := tube.FillAmount - tube.FillTarget
-		nextLevel := tube.Level + 1
-		nextTarget := 100
-		for _, tl := range models.TubeLevels {
-			if tl.Level == nextLevel {
-				nextTarget = tl.FillTarget
-				break
-			}
-		}
-		if nextLevel > len(models.TubeLevels) {
-			nextLevel = 1 // loop back
-		}
-		h.pg.LevelUpTube(r.Context(), req.RoomID, nextLevel, nextTarget, overflow)
-		tube.Level = nextLevel
-		tube.FillAmount = overflow
-		tube.FillTarget = nextTarget
+	// Resolve any tube overflow atomically in the store (a row lock, so
+	// two concurrent tips can't both level-up from the same snapshot).
+	targets := make(map[int]int, len(models.TubeLevels))
+	for _, tl := range models.TubeLevels {
+		targets[tl.Level] = tl.FillTarget
+	}
+	tube, poweredUp, err := h.pg.ResolveTubeOverflow(r.Context(), req.RoomID, targets, len(models.TubeLevels))
+	if err != nil {
+		log.Printf("[neon] tube overflow resolve for room=%s: %v", req.RoomID, err)
+		tube, _ = h.pg.GetNeonTube(r.Context(), req.RoomID)
 	}
 
 	balance, _ := h.pg.GetNeonBalance(r.Context(), user.ID)

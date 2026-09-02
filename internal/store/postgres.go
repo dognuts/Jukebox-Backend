@@ -314,9 +314,21 @@ func (s *PGStore) ListRooms(ctx context.Context, liveOnly bool, genre string) ([
 		args = append(args, genre)
 		idx++
 	}
-	query += " ORDER BY is_live DESC, last_active_at DESC NULLS LAST, created_at DESC"
+	// Hard cap: this payload embeds cover art and is rebuilt for every
+	// visitor — without a LIMIT, scripted room creation could grow it
+	// without bound (the ISR homepage fetch has hard body-size limits).
+	query += " ORDER BY is_live DESC, last_active_at DESC NULLS LAST, created_at DESC LIMIT 200"
 
 	return s.queryRooms(ctx, query, args...)
+}
+
+// CountActiveRoomsByCreator counts a user's rooms that have not ended,
+// for the per-user concurrent-room cap.
+func (s *PGStore) CountActiveRoomsByCreator(ctx context.Context, userID string) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM rooms WHERE creator_user_id = $1 AND ended_at IS NULL`, userID).Scan(&n)
+	return n, err
 }
 
 // ListAllRooms returns all rooms without any time filter (for admin).
@@ -463,10 +475,16 @@ func (s *PGStore) UpsertTracks(ctx context.Context, tracks []*models.Track) erro
 	return err
 }
 
-func (s *PGStore) UpdateTrackDuration(ctx context.Context, trackID string, duration int) error {
-	_, err := s.pool.Exec(ctx,
+// UpdateTrackDuration is learn-once at the SQL level (only rows still at
+// duration 0 update) and reports whether THIS call won the write — a
+// caller that lost a concurrent race must not act on its own value.
+func (s *PGStore) UpdateTrackDuration(ctx context.Context, trackID string, duration int) (bool, error) {
+	tag, err := s.pool.Exec(ctx,
 		`UPDATE tracks SET duration = $2 WHERE id = $1 AND duration = 0`, trackID, duration)
-	return err
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
 }
 
 func (s *PGStore) UpdateTrackInfoSnippet(ctx context.Context, trackID string, snippet string) error {
@@ -659,10 +677,24 @@ func (s *PGStore) GetApprovedQueueCounts(ctx context.Context, roomIDs []string) 
 	return out, rows.Err()
 }
 
-func (s *PGStore) UpdateQueueEntryStatus(ctx context.Context, entryID string, status models.QueueEntryStatus) error {
+// UpdateQueueEntryStatus is scoped to a room: entry IDs are public (queue
+// GET, submit responses), so an unscoped update would let the DJ of one
+// room approve/reject entries in any other room by ID.
+func (s *PGStore) UpdateQueueEntryStatus(ctx context.Context, roomID, entryID string, status models.QueueEntryStatus) error {
 	_, err := s.pool.Exec(ctx,
-		`UPDATE queue_entries SET status = $2 WHERE id = $1`, entryID, status)
+		`UPDATE queue_entries SET status = $3 WHERE id = $1 AND room_id = $2`, entryID, roomID, status)
 	return err
+}
+
+// CountActiveQueueEntriesBySession counts a session's pending+approved
+// entries in a room, for per-submitter queue caps.
+func (s *PGStore) CountActiveQueueEntriesBySession(ctx context.Context, roomID, sessionID string) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM queue_entries
+		WHERE room_id = $1 AND session_id = $2 AND status IN ('pending','approved')`,
+		roomID, sessionID).Scan(&n)
+	return n, err
 }
 
 func (s *PGStore) PopNextTrack(ctx context.Context, roomID string) (*models.QueueEntry, error) {

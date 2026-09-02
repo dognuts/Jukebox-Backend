@@ -8,20 +8,23 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/jukebox/backend/internal/antispam"
 	"github.com/jukebox/backend/internal/middleware"
 	"github.com/jukebox/backend/internal/models"
+	"github.com/jukebox/backend/internal/moderation"
 	"github.com/jukebox/backend/internal/store"
 	"github.com/jukebox/backend/internal/ws"
 )
 
 type QueueHandler struct {
-	pg    *store.PGStore
-	redis *store.RedisStore
-	hubs  *ws.HubManager
+	pg      *store.PGStore
+	redis   *store.RedisStore
+	hubs    *ws.HubManager
+	limiter *antispam.RateLimiter
 }
 
-func NewQueueHandler(pg *store.PGStore, redis *store.RedisStore, hubs *ws.HubManager) *QueueHandler {
-	return &QueueHandler{pg: pg, redis: redis, hubs: hubs}
+func NewQueueHandler(pg *store.PGStore, redis *store.RedisStore, hubs *ws.HubManager, limiter *antispam.RateLimiter) *QueueHandler {
+	return &QueueHandler{pg: pg, redis: redis, hubs: hubs, limiter: limiter}
 }
 
 // GET /api/rooms/{slug}/queue
@@ -77,6 +80,30 @@ func (h *QueueHandler) SubmitTrack(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid JSON", http.StatusBadRequest)
 		return
+	}
+
+	// Same validation, moderation, rate limit, and per-submitter cap as
+	// the WS submit path — this endpoint had none of them, so it was the
+	// easier flood/beacon vector of the two.
+	if err := models.ValidateTrackSubmission(req.Title, req.Artist, req.Source, req.SourceURL, req.Duration, isDJ); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if moderation.ContainsProfanity(req.Title) || moderation.ContainsProfanity(req.Artist) {
+		http.Error(w, "track title contains prohibited language", http.StatusBadRequest)
+		return
+	}
+	if !isDJ {
+		if h.limiter != nil {
+			if allowed, _ := h.limiter.AllowQueueSubmit(ctx, session.ID, room.ID); !allowed {
+				http.Error(w, "you're submitting too fast — please slow down", http.StatusTooManyRequests)
+				return
+			}
+		}
+		if n, err := h.pg.CountActiveQueueEntriesBySession(ctx, room.ID, session.ID); err == nil && n >= 10 {
+			http.Error(w, "you already have 10 tracks waiting — let some play first", http.StatusTooManyRequests)
+			return
+		}
 	}
 
 	// Create track

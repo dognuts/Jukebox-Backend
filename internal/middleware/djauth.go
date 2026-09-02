@@ -100,11 +100,12 @@ func VerifyDJKey(plainKey, hash string) bool {
 	return true
 }
 
-// ExtractDJKey pulls the DJ key from the request.
-// Checks query param ?djKey=... first, then X-DJ-Key header.
+// ExtractDJKey pulls the DJ key from the X-DJ-Key header. The old
+// ?djKey=... query-param branch is gone: the DJ key is a permanent,
+// non-rotating room credential, and query strings are written verbatim
+// into request logs (chi logger, reverse proxies). WebSocket handshakes —
+// the one place headers aren't available — authenticate via single-use
+// tickets instead (see handlers.WSTicketHandler).
 func ExtractDJKey(r *http.Request) string {
-	if key := r.URL.Query().Get("djKey"); key != "" {
-		return key
-	}
 	return r.Header.Get("X-DJ-Key")
 }

@@ -15,8 +15,12 @@ const SessionKey contextKey = "session"
 
 const cookieName = "jukebox_session"
 
-// SessionMiddleware ensures every request has an anonymous session.
-// If no valid session cookie exists, one is created.
+// SessionMiddleware resolves an existing anonymous session from the
+// request (cookie or X-Session-ID header) into context. It deliberately
+// does NOT create sessions: when every bare request minted a 24h Redis
+// key, a cookieless request loop was a trivial Redis-exhaustion vector —
+// and a full Redis fail-opens the rate limiters. Creation happens only in
+// EnsureSession (GET /api/session), which the frontend calls at bootstrap.
 func SessionMiddleware(redis *store.RedisStore) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -45,44 +49,46 @@ func SessionMiddleware(redis *store.RedisStore) func(http.Handler) http.Handler 
 				session = resolve(cookie.Value)
 			}
 
-			// Also check query param (for WebSocket connections where cookies may not be sent cross-origin)
-			if session == nil {
-				if sid := r.URL.Query().Get("session"); sid != "" {
-					session = resolve(sid)
-				}
-			}
-
-			// Also check Authorization header (for non-browser clients)
+			// Also check header (the frontend's normal transport; cookies
+			// are unreliable cross-site). The old ?session= query-param
+			// branch is gone — bearer credentials do not belong in URLs,
+			// which end up in request logs; WebSocket connections carry
+			// identity via single-use tickets instead.
 			if session == nil {
 				if sid := r.Header.Get("X-Session-ID"); sid != "" {
 					session = resolve(sid)
 				}
 			}
 
-			// Create new session if none found
-			if session == nil {
-				var err error
-				session, err = redis.CreateSession(ctx)
-				if err != nil {
-					http.Error(w, "failed to create session", http.StatusInternalServerError)
-					return
-				}
-				putCachedSession(session.ID, session)
-				http.SetCookie(w, &http.Cookie{
-					Name:     cookieName,
-					Value:    session.ID,
-					Path:     "/",
-					HttpOnly: true,
-					SameSite: http.SameSiteNoneMode,
-					Secure:   true,
-					MaxAge:   int(24 * time.Hour / time.Second),
-				})
+			if session != nil {
+				ctx = context.WithValue(ctx, SessionKey, session)
 			}
-
-			ctx = context.WithValue(ctx, SessionKey, session)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
+}
+
+// EnsureSession returns the request's session, creating one (and setting
+// the cookie) if none exists. Only session-bootstrap endpoints call this.
+func EnsureSession(w http.ResponseWriter, r *http.Request, redis *store.RedisStore) (*models.Session, error) {
+	if s := GetSession(r.Context()); s != nil {
+		return s, nil
+	}
+	session, err := redis.CreateSession(r.Context())
+	if err != nil {
+		return nil, err
+	}
+	putCachedSession(session.ID, session)
+	http.SetCookie(w, &http.Cookie{
+		Name:     cookieName,
+		Value:    session.ID,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteNoneMode,
+		Secure:   true,
+		MaxAge:   int(24 * time.Hour / time.Second),
+	})
+	return session, nil
 }
 
 // GetSession retrieves the session from request context.

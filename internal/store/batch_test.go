@@ -278,8 +278,8 @@ func TestUpsertAutoplayTrackRefreshesMetadata(t *testing.T) {
 	}
 
 	// Client reports the real duration (playlist still says 0).
-	if err := s.UpdateTrackDuration(ctx, tr.ID, 240); err != nil {
-		t.Fatalf("UpdateTrackDuration: %v", err)
+	if won, err := s.UpdateTrackDuration(ctx, tr.ID, 240); err != nil || !won {
+		t.Fatalf("UpdateTrackDuration: won=%v err=%v", won, err)
 	}
 
 	// Next loop of the playlist: retitled, duration still unknown upstream.

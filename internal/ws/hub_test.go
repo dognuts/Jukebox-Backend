@@ -74,7 +74,10 @@ func (f *fakeStore) AddToQueue(ctx context.Context, entry *models.QueueEntry) er
 	f.queue = append(f.queue, *entry)
 	return nil
 }
-func (f *fakeStore) UpdateQueueEntryStatus(ctx context.Context, entryID string, status models.QueueEntryStatus) error {
+func (f *fakeStore) CountActiveQueueEntriesBySession(ctx context.Context, roomID, sessionID string) (int, error) {
+	return 0, nil
+}
+func (f *fakeStore) UpdateQueueEntryStatus(ctx context.Context, roomID, entryID string, status models.QueueEntryStatus) error {
 	return nil
 }
 func (f *fakeStore) PopNextTrack(ctx context.Context, roomID string) (*models.QueueEntry, error) {

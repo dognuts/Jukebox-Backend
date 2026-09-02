@@ -283,15 +283,47 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	req.Email = strings.ToLower(strings.TrimSpace(req.Email))
 	ctx := r.Context()
 
+	// Per-ACCOUNT limit alongside the per-IP one: a distributed brute
+	// force against a single account gets throttled regardless of how
+	// many source IPs it uses. Only FAILURES count (recorded below), so
+	// an attacker hammering a victim's email can't lock the real owner
+	// out beyond one window, and active legitimate users are unaffected.
+	if h.signupRateLimiter != nil {
+		blocked, _ := h.signupRateLimiter.LoginAccountBlocked(ctx, req.Email)
+		if blocked {
+			log.Printf("[antispam] login failure limit exceeded for account %s", sanitizeLogValue(req.Email))
+			http.Error(w, "too many login attempts — please try again later", http.StatusTooManyRequests)
+			return
+		}
+	}
+
 	user, err := h.pg.GetUserByEmail(ctx, req.Email)
 	if err != nil || user == nil {
+		// Burn the same bcrypt cost as a real compare so response timing
+		// doesn't reveal whether the email is registered.
+		bcrypt.CompareHashAndPassword(dummyBcryptHash, []byte(req.Password))
+		if h.signupRateLimiter != nil {
+			h.signupRateLimiter.RecordLoginFailure(ctx, req.Email)
+		}
 		http.Error(w, "invalid email or password", http.StatusUnauthorized)
 		return
 	}
 
 	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(req.Password)); err != nil {
+		if h.signupRateLimiter != nil {
+			h.signupRateLimiter.RecordLoginFailure(ctx, req.Email)
+		}
 		http.Error(w, "invalid email or password", http.StatusUnauthorized)
 		return
+	}
+
+	if user.IsBanned {
+		http.Error(w, "account suspended", http.StatusForbidden)
+		return
+	}
+
+	if h.signupRateLimiter != nil {
+		h.signupRateLimiter.ClearLoginFailures(ctx, req.Email)
 	}
 
 	accessToken, _ := middleware.GenerateAccessToken(user, h.jwtSecret)
@@ -335,17 +367,46 @@ func (h *AuthHandler) RefreshToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if rt.RevokedAt != nil || rt.ExpiresAt.Before(time.Now()) {
+	// Reuse detection: a token with revoked_at set was consumed by a
+	// previous rotation (bulk revocations DELETE rows, so rotation is the
+	// only writer of revoked_at). Replaying it means the legitimate
+	// client or a thief holds a stale fork of the chain. A short grace
+	// period distinguishes benign races — two browser tabs refreshing the
+	// same stored token within moments of each other — from a genuinely
+	// stale replay, which is the theft signal that kills the family.
+	const rotationGrace = 15 * time.Second
+	if rt.RevokedAt != nil {
+		if time.Since(*rt.RevokedAt) > rotationGrace {
+			log.Printf("[auth] refresh token reuse detected for user %s — revoking all sessions", rt.UserID)
+			if err := h.pg.RevokeAllUserRefreshTokens(ctx, rt.UserID); err != nil {
+				log.Printf("[auth] family revoke for user %s failed: %v", rt.UserID, err)
+			}
+		}
+		http.Error(w, "refresh token expired or revoked", http.StatusUnauthorized)
+		return
+	}
+	if rt.ExpiresAt.Before(time.Now()) {
 		http.Error(w, "refresh token expired or revoked", http.StatusUnauthorized)
 		return
 	}
 
-	// Revoke old token (rotation)
-	h.pg.RevokeRefreshToken(ctx, rt.ID)
+	// Rotate atomically: the conditional revoke succeeds for exactly one
+	// caller. Losing the race means a concurrent request just rotated
+	// this token — inside the grace window that's the multi-tab case, so
+	// answer 401 and let the client pick up the winner's tokens.
+	rotated, err := h.pg.RevokeRefreshTokenIfActive(ctx, rt.ID)
+	if err != nil || !rotated {
+		http.Error(w, "refresh token expired or revoked", http.StatusUnauthorized)
+		return
+	}
 
 	user, _ := h.pg.GetUserByID(ctx, rt.UserID)
 	if user == nil {
 		http.Error(w, "user not found", http.StatusUnauthorized)
+		return
+	}
+	if user.IsBanned {
+		http.Error(w, "account suspended", http.StatusForbidden)
 		return
 	}
 
@@ -431,6 +492,16 @@ func (h *AuthHandler) ResendVerification(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Cooldown keyed on the TARGET address: without it, an account created
+	// with someone else's email is an unlimited email-bombing machine.
+	if h.signupRateLimiter != nil {
+		allowed, _ := h.signupRateLimiter.AllowEmailSend(r.Context(), "verify", user.Email)
+		if !allowed {
+			http.Error(w, "a verification email was sent recently — please wait before requesting another", http.StatusTooManyRequests)
+			return
+		}
+	}
+
 	verifyToken := generateSecureToken()
 	verification := &models.EmailVerification{
 		ID:        uuid.New().String(),
@@ -460,6 +531,22 @@ func (h *AuthHandler) ForgotPassword(w http.ResponseWriter, r *http.Request) {
 
 	req.Email = strings.ToLower(strings.TrimSpace(req.Email))
 	ctx := r.Context()
+
+	// Rate limit per source IP and per TARGET address — this endpoint is
+	// unauthenticated and sends real email, so without both limits it is
+	// a victim-inbox bomber and a Resend-quota drain.
+	if h.signupRateLimiter != nil {
+		if allowed, _ := h.signupRateLimiter.AllowPasswordResetIP(ctx, ClientIP(r)); !allowed {
+			http.Error(w, "too many requests — please try again later", http.StatusTooManyRequests)
+			return
+		}
+		if allowed, _ := h.signupRateLimiter.AllowEmailSend(ctx, "reset", req.Email); !allowed {
+			// Same uniform body as the success path: a distinct answer here
+			// would leak nothing about registration, but keep it quiet anyway.
+			writeJSON(w, http.StatusOK, map[string]string{"status": "if that email exists, a reset link has been sent"})
+			return
+		}
+	}
 
 	// Always return success to prevent email enumeration
 	user, _ := h.pg.GetUserByEmail(ctx, req.Email)
@@ -610,11 +697,21 @@ func (h *AuthHandler) UpdateProfile(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "bio must be 300 characters or less", http.StatusBadRequest)
 			return
 		}
+		if moderation.ContainsProfanity(b) {
+			http.Error(w, "bio contains inappropriate language", http.StatusBadRequest)
+			return
+		}
 		bio = b
 	}
 
 	avatarColor := user.AvatarColor
 	if req.AvatarColor != nil {
+		// Rendered into other users' inline styles (DMs, chat) — must be a
+		// plain color value, never url(...) or other CSS smuggling.
+		if err := validateCSSValue(*req.AvatarColor, 80); err != nil {
+			http.Error(w, "invalid avatar color", http.StatusBadRequest)
+			return
+		}
 		avatarColor = *req.AvatarColor
 	}
 
@@ -797,6 +894,12 @@ func generateSecureToken() string {
 	rand.Read(b)
 	return hex.EncodeToString(b)
 }
+
+// dummyBcryptHash is a valid-format bcrypt hash compared against when a
+// login targets a nonexistent account, so both paths cost the same and
+// response timing can't be used to enumerate registered emails. The
+// compare's outcome is ignored.
+var dummyBcryptHash = []byte("$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy")
 
 // geolocateIP uses ip-api.com (free, no key required) to get location from IP.
 func geolocateIP(ctx context.Context, ip string) (city, region, country string) {

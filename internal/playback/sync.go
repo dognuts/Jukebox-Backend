@@ -31,15 +31,58 @@ func NewSyncService(pg *store.PGStore, redis *store.RedisStore, hubs *ws.HubMana
 		timers:      make(map[string]*time.Timer),
 		lastAdvance: make(map[string]time.Time),
 	}
-	// Wire up the autoplay end callback so listeners can trigger track advance
+	// Wire up the autoplay end callback so listeners can trigger track
+	// advance — via the verified path, never advanceTrack directly: the
+	// report comes from an untrusted anonymous client.
 	hubs.OnAutoplayEnd = func(roomID string) {
-		s.advanceTrack(roomID)
+		s.handleClientEndReport(roomID)
 	}
 	// Wire up duration reporting so autoplay timers use real durations
 	hubs.OnReportDuration = func(roomID string, trackID string, duration int) {
 		s.handleDurationReport(roomID, trackID, duration)
 	}
 	return s
+}
+
+// handleClientEndReport processes an autoplay_track_ended frame from a
+// listener. Untrusted input: any anonymous socket can send it, so before
+// the old code advanced on every report (10s debounce only), one client
+// could skip every track in any room. Verify against server-side playback
+// state before advancing.
+func (s *SyncService) handleClientEndReport(roomID string) {
+	ctx := context.Background()
+
+	// Only autoplay rooms take listener end-reports at all — DJ rooms
+	// advance via the DJ-gated dj_skip action.
+	room, _ := s.pg.GetRoomByID(ctx, roomID)
+	if room == nil || !room.IsAutoplay {
+		return
+	}
+
+	ps, _ := s.redis.GetPlaybackState(ctx, roomID)
+	if ps == nil || !ps.IsPlaying || ps.TrackID == "" {
+		return
+	}
+
+	elapsed := time.Since(time.UnixMilli(ps.StartedAtUnix))
+
+	track, _ := s.pg.GetTrack(ctx, ps.TrackID)
+	if track != nil && track.Duration > 0 {
+		// Known duration: accept the report only near the real end (small
+		// slack for player-side buffering/timing skew).
+		if elapsed < time.Duration(track.Duration)*time.Second-5*time.Second {
+			return
+		}
+	} else {
+		// Unknown duration (fresh autoplay track before any duration
+		// report lands): the report is the only end signal we have, but
+		// require a minimum play time so it can't be used to strobe-skip.
+		if elapsed < 60*time.Second {
+			return
+		}
+	}
+
+	s.advanceTrack(roomID)
 }
 
 // ScheduleAdvance sets a timer to advance to the next track when the current one ends.
@@ -243,27 +286,53 @@ func (s *SyncService) advanceAutoplay(ctx context.Context, roomID string, hub *w
 	log.Printf("[autoplay] room %s now playing [%d]: %s - %s", roomID, idx, track.Artist, track.Title)
 }
 
-// handleDurationReport updates the track duration and reschedules the advance timer.
+// handleDurationReport updates the track duration and reschedules the
+// advance timer. Untrusted input from any listener, so it is constrained:
+// sane bounds, only for the track CURRENTLY playing in that room (no
+// cross-room/arbitrary-track poisoning), only in autoplay rooms (the only
+// place the server needs a client-reported length), and learn-once — a
+// track that already has a duration keeps it.
 func (s *SyncService) handleDurationReport(roomID, trackID string, duration int) {
-	if duration <= 0 {
+	// Floor of 60s: learn-once means the FIRST reporter wins, so a low
+	// floor would let an attacker pre-poison each fresh track with a tiny
+	// duration and strobe-skip the room within the rules. 60s matches the
+	// unknown-duration minimum in handleClientEndReport, capping the
+	// worst-case skip rate either way.
+	if duration < 60 || duration > models.MaxTrackDurationSecs {
 		return
 	}
 	ctx := context.Background()
 
-	// Update the track in the DB
-	if err := s.pg.UpdateTrackDuration(ctx, trackID, duration); err != nil {
-		log.Printf("[playback] failed to update track duration: %v", err)
+	room, _ := s.pg.GetRoomByID(ctx, roomID)
+	if room == nil || !room.IsAutoplay {
 		return
 	}
 
-	// Check if this is the currently playing track
+	// Only the currently playing track accepts reports.
 	ps, _ := s.redis.GetPlaybackState(ctx, roomID)
 	if ps == nil || ps.TrackID != trackID || !ps.IsPlaying {
 		return
 	}
 
+	track, _ := s.pg.GetTrack(ctx, trackID)
+	if track == nil || track.Duration > 0 {
+		return // unknown track, or duration already learned
+	}
+
+	// Update the track in the DB. Only the report that actually won the
+	// learn-once write reschedules the timer — a raced loser acting on
+	// its own value would override the winner's schedule.
+	won, err := s.pg.UpdateTrackDuration(ctx, trackID, duration)
+	if err != nil {
+		log.Printf("[playback] failed to update track duration: %v", err)
+		return
+	}
+	if !won {
+		return
+	}
+
 	// Reschedule the advance timer with the real duration
-	track := &models.Track{ID: trackID, Duration: duration}
+	track.Duration = duration
 	s.ScheduleAdvance(roomID, track, ps.StartedAtUnix)
 	log.Printf("[playback] room %s: updated track duration to %ds, rescheduled advance", roomID, duration)
 }

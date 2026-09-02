@@ -130,7 +130,11 @@ func (h *AdminHandler) CreateOfficialRoom(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	session := middleware.GetSession(r.Context())
+	// Sessions are created lazily now, so an admin API call may carry none.
+	djSessionID := ""
+	if session := middleware.GetSession(r.Context()); session != nil {
+		djSessionID = session.ID
+	}
 	slug := toSlug(req.Name) + "-" + time.Now().Format("0102")
 
 	vibes := req.Vibes
@@ -168,7 +172,7 @@ func (h *AdminHandler) CreateOfficialRoom(w http.ResponseWriter, r *http.Request
 		IsOfficial:     true,
 		IsFeatured:     req.IsFeatured,
 		DJKeyHash:      djKeyHash,
-		DJSessionID:    session.ID,
+		DJSessionID:    djSessionID,
 		CreatedAt:      time.Now(),
 		ScheduledStart: scheduledStart,
 		ExpiresAt:      expiresAt,
@@ -258,7 +262,7 @@ func (h *AdminHandler) DeleteRoom(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("[admin] deleted room %s (%s)", room.Name, room.ID)
+	log.Printf("[admin] deleted room %s (%s)", sanitizeLogValue(room.Name), room.ID)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
@@ -338,6 +342,12 @@ func (h *AdminHandler) UpdateRoom(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if req.CoverGradient != nil {
+		// Defense in depth: admin-gated, but the value still renders in
+		// every visitor's inline styles.
+		if err := validateCSSValue(*req.CoverGradient, 300); err != nil {
+			http.Error(w, "invalid cover gradient", http.StatusBadRequest)
+			return
+		}
 		if err := h.pg.SetRoomCoverGradient(ctx, roomID, *req.CoverGradient); err != nil {
 			log.Printf("admin update cover gradient: %v", err)
 			http.Error(w, "failed to update cover gradient", http.StatusInternalServerError)
@@ -450,7 +460,10 @@ func (h *AdminHandler) UpdateUser(w http.ResponseWriter, r *http.Request) {
 		h.pg.AdminSetField(ctx, userID, "email_verified", *req.EmailVerified)
 	}
 	if req.IsPlus != nil {
-		h.pg.AdminSetField(ctx, userID, "is_plus", *req.IsPlus)
+		// AdminSetPlus, not a bare column flip: is_plus is now derived
+		// with plus_expires_at, so granting must also clear a stale
+		// expiry or the grant is silently ineffective.
+		h.pg.AdminSetPlus(ctx, userID, *req.IsPlus)
 	}
 	if req.NeonBalance != nil {
 		h.pg.AdminSetField(ctx, userID, "neon_balance", *req.NeonBalance)
@@ -461,6 +474,10 @@ func (h *AdminHandler) UpdateUser(w http.ResponseWriter, r *http.Request) {
 	if req.StageName != nil {
 		h.pg.AdminSetField(ctx, userID, "stage_name", *req.StageName)
 	}
+
+	// Drop the auth-middleware cache entry so bans/role changes take
+	// effect on the target's next request, not after the cache TTL.
+	middleware.InvalidateCachedUser(userID)
 
 	user, _ := h.pg.AdminGetUser(ctx, userID)
 	writeJSON(w, http.StatusOK, user)

@@ -25,11 +25,11 @@ func (s *PGStore) GetUserByEmail(ctx context.Context, email string) (*models.Use
 	u := &models.User{}
 	err := s.pool.QueryRow(ctx, `
 		SELECT id, email, email_verified, password_hash, display_name, avatar_color, avatar_url, bio, favorite_genres, created_at, updated_at, is_admin, city, region, country, stage_name,
-		       is_plus, plus_since, plus_expires_at, neon_balance, stripe_customer_id
+		       (is_plus AND (plus_expires_at IS NULL OR plus_expires_at > NOW())) AS is_plus, plus_since, plus_expires_at, neon_balance, stripe_customer_id, is_banned
 		FROM users WHERE email = $1`, email,
 	).Scan(&u.ID, &u.Email, &u.EmailVerified, &u.PasswordHash, &u.DisplayName,
 		&u.AvatarColor, &u.AvatarURL, &u.Bio, &u.FavoriteGenres, &u.CreatedAt, &u.UpdatedAt, &u.IsAdmin, &u.City, &u.Region, &u.Country, &u.StageName,
-		&u.IsPlus, &u.PlusSince, &u.PlusExpiresAt, &u.NeonBalance, &u.StripeCustomerID)
+		&u.IsPlus, &u.PlusSince, &u.PlusExpiresAt, &u.NeonBalance, &u.StripeCustomerID, &u.IsBanned)
 	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
@@ -40,11 +40,11 @@ func (s *PGStore) GetUserByID(ctx context.Context, id string) (*models.User, err
 	u := &models.User{}
 	err := s.pool.QueryRow(ctx, `
 		SELECT id, email, email_verified, password_hash, display_name, avatar_color, avatar_url, bio, favorite_genres, created_at, updated_at, is_admin, city, region, country, stage_name,
-		       is_plus, plus_since, plus_expires_at, neon_balance, stripe_customer_id
+		       (is_plus AND (plus_expires_at IS NULL OR plus_expires_at > NOW())) AS is_plus, plus_since, plus_expires_at, neon_balance, stripe_customer_id, is_banned
 		FROM users WHERE id = $1`, id,
 	).Scan(&u.ID, &u.Email, &u.EmailVerified, &u.PasswordHash, &u.DisplayName,
 		&u.AvatarColor, &u.AvatarURL, &u.Bio, &u.FavoriteGenres, &u.CreatedAt, &u.UpdatedAt, &u.IsAdmin, &u.City, &u.Region, &u.Country, &u.StageName,
-		&u.IsPlus, &u.PlusSince, &u.PlusExpiresAt, &u.NeonBalance, &u.StripeCustomerID)
+		&u.IsPlus, &u.PlusSince, &u.PlusExpiresAt, &u.NeonBalance, &u.StripeCustomerID, &u.IsBanned)
 	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
@@ -83,6 +83,12 @@ func (s *PGStore) DeleteUser(ctx context.Context, userID string) error {
 // ==================== Email Verification ====================
 
 func (s *PGStore) CreateEmailVerification(ctx context.Context, v *models.EmailVerification) error {
+	// Invalidate any outstanding tokens first (mirrors CreatePasswordReset):
+	// at most one live verification token per user, and the table can't be
+	// grown unboundedly by hammering resend.
+	_, _ = s.pool.Exec(ctx,
+		`UPDATE email_verifications SET used_at = NOW() WHERE user_id = $1 AND used_at IS NULL`, v.UserID)
+
 	_, err := s.pool.Exec(ctx, `
 		INSERT INTO email_verifications (id, user_id, token, expires_at, created_at)
 		VALUES ($1, $2, $3, $4, $5)`,
@@ -167,8 +173,26 @@ func (s *PGStore) RevokeRefreshToken(ctx context.Context, id string) error {
 	return err
 }
 
+// RevokeRefreshTokenIfActive revokes the token only if it has not already
+// been revoked, reporting whether this caller won. Rotation must use this
+// (not the unconditional revoke): exactly one of any set of concurrent
+// refreshes may rotate the token; the losers are treated as token reuse.
+func (s *PGStore) RevokeRefreshTokenIfActive(ctx context.Context, id string) (bool, error) {
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE refresh_tokens SET revoked_at = NOW() WHERE id = $1 AND revoked_at IS NULL`, id)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+// RevokeAllUserRefreshTokens kills every token the user holds by DELETING
+// the rows (not setting revoked_at): reuse detection treats revoked_at as
+// "consumed by rotation", so bulk revocation must leave no revoked rows
+// behind — otherwise a stale device replaying its old token after a
+// password change would look like theft and nuke the fresh session too.
 func (s *PGStore) RevokeAllUserRefreshTokens(ctx context.Context, userID string) error {
-	_, err := s.pool.Exec(ctx, `UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL`, userID)
+	_, err := s.pool.Exec(ctx, `DELETE FROM refresh_tokens WHERE user_id = $1`, userID)
 	return err
 }
 

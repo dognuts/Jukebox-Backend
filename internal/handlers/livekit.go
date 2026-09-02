@@ -9,14 +9,16 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/jukebox/backend/internal/config"
 	"github.com/jukebox/backend/internal/middleware"
+	"github.com/jukebox/backend/internal/store"
 )
 
 type LiveKitHandler struct {
 	cfg *config.Config
+	pg  *store.PGStore
 }
 
-func NewLiveKitHandler(cfg *config.Config) *LiveKitHandler {
-	return &LiveKitHandler{cfg: cfg}
+func NewLiveKitHandler(cfg *config.Config, pg *store.PGStore) *LiveKitHandler {
+	return &LiveKitHandler{cfg: cfg, pg: pg}
 }
 
 // LiveKit JWT claims — follows LiveKit's access token spec
@@ -76,17 +78,28 @@ func (h *LiveKitHandler) GetToken(w http.ResponseWriter, r *http.Request) {
 	// LiveKit room name = "jukebox:" + slug
 	livekitRoom := "jukebox:" + req.RoomSlug
 
-	// Build grants — DJ can publish audio, listeners can only subscribe
+	// Build grants — DJ can publish audio, listeners can only subscribe.
+	// Publish rights are granted ONLY on proof of the room's DJ key —
+	// never on the client's say-so, which would let any visitor broadcast
+	// audio into any room's voice channel.
 	grant := &liveKitGrant{
 		RoomJoin:     true,
 		Room:         livekitRoom,
 		CanSubscribe: boolPtr(true),
+		CanPublish:   boolPtr(false),
 	}
 
 	if req.IsDJ {
+		room, err := h.pg.GetRoomBySlug(r.Context(), req.RoomSlug)
+		if err != nil || room == nil {
+			http.Error(w, "room not found", http.StatusNotFound)
+			return
+		}
+		if !middleware.VerifyDJKey(middleware.ExtractDJKey(r), room.DJKeyHash) {
+			http.Error(w, "DJ key required to publish", http.StatusForbidden)
+			return
+		}
 		grant.CanPublish = boolPtr(true)
-	} else {
-		grant.CanPublish = boolPtr(false)
 	}
 
 	now := time.Now()
@@ -96,7 +109,7 @@ func (h *LiveKitHandler) GetToken(w http.ResponseWriter, r *http.Request) {
 			Subject:   identity,
 			NotBefore: jwt.NewNumericDate(now),
 			IssuedAt:  jwt.NewNumericDate(now),
-			ExpiresAt: jwt.NewNumericDate(now.Add(6 * time.Hour)),
+			ExpiresAt: jwt.NewNumericDate(now.Add(2 * time.Hour)),
 			ID:        identity + ":" + req.RoomSlug,
 		},
 		Video: grant,

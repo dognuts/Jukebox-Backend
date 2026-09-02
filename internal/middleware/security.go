@@ -66,3 +66,25 @@ func MaxBodySize(maxBytes int64) func(http.Handler) http.Handler {
 		})
 	}
 }
+
+// RequireJSONContentType rejects mutating requests whose non-empty body
+// is not declared as JSON. This is the CSRF backstop for the cross-site
+// session cookie (SameSite=None): a hostile page can auto-submit an HTML
+// form with enctype=text/plain carrying a JSON-shaped body and the
+// browser will attach the cookie — but it cannot set Content-Type:
+// application/json without a CORS preflight, which the CORS policy gates.
+func RequireJSONContentType(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+			if r.ContentLength != 0 {
+				ct := r.Header.Get("Content-Type")
+				if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(ct)), "application/json") {
+					http.Error(w, "Content-Type must be application/json", http.StatusUnsupportedMediaType)
+					return
+				}
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
