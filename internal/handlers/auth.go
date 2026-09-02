@@ -29,11 +29,12 @@ type AuthHandler struct {
 	emailSvc           *email.Service
 	jwtSecret          string
 	turnstileSecret    string
+	turnstileHostnames []string // hostnames captcha tokens may be solved on
 	signupRateLimiter  *antispam.RateLimiter
 }
 
-func NewAuthHandler(pg *store.PGStore, redis *store.RedisStore, emailSvc *email.Service, jwtSecret string, turnstileSecret string, rateLimiter *antispam.RateLimiter) *AuthHandler {
-	return &AuthHandler{pg: pg, redis: redis, emailSvc: emailSvc, jwtSecret: jwtSecret, turnstileSecret: turnstileSecret, signupRateLimiter: rateLimiter}
+func NewAuthHandler(pg *store.PGStore, redis *store.RedisStore, emailSvc *email.Service, jwtSecret string, turnstileSecret string, turnstileHostnames []string, rateLimiter *antispam.RateLimiter) *AuthHandler {
+	return &AuthHandler{pg: pg, redis: redis, emailSvc: emailSvc, jwtSecret: jwtSecret, turnstileSecret: turnstileSecret, turnstileHostnames: turnstileHostnames, signupRateLimiter: rateLimiter}
 }
 
 // POST /api/auth/signup
@@ -70,7 +71,7 @@ func (h *AuthHandler) Signup(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// --- Anti-spam: Turnstile CAPTCHA ---
-	if err := antispam.VerifyTurnstile(r.Context(), h.turnstileSecret, req.CaptchaToken, ip); err != nil {
+	if err := antispam.VerifyTurnstile(r.Context(), h.turnstileSecret, req.CaptchaToken, ip, h.turnstileHostnames); err != nil {
 		log.Printf("[antispam] captcha failed from %s: %v", ip, err)
 		http.Error(w, "captcha verification failed — please try again", http.StatusBadRequest)
 		return
@@ -87,6 +88,14 @@ func (h *AuthHandler) Signup(w http.ResponseWriter, r *http.Request) {
 	if antispam.IsDisposableEmail(req.Email) {
 		log.Printf("[antispam] disposable email blocked: %s", req.Email)
 		http.Error(w, "disposable email addresses are not allowed — please use a permanent email", http.StatusBadRequest)
+		return
+	}
+
+	// --- Anti-spam: the domain must actually be able to receive mail ---
+	// (fails open on transient DNS errors; see antispam.DomainAcceptsEmail)
+	if !antispam.DomainAcceptsEmail(r.Context(), req.Email) {
+		log.Printf("[antispam] undeliverable email domain blocked: %s", req.Email)
+		http.Error(w, "this email domain cannot receive mail — please check for typos", http.StatusBadRequest)
 		return
 	}
 

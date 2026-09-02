@@ -414,6 +414,8 @@ func TestChatBroadcastFirstThenPersisted(t *testing.T) {
 	h := newTestHub(t, store)
 
 	client := NewClient(h, nil, testSession("s-1", "Alice"))
+	client.UserID = "u-1"
+	client.User = &models.User{ID: "u-1", EmailVerified: true}
 	addClient(h, client)
 
 	payload, _ := json.Marshal(ChatPayload{Message: "hello room"})
@@ -454,6 +456,70 @@ func TestChatBroadcastFirstThenPersisted(t *testing.T) {
 			t.Fatalf("chat message not persisted (got %d rows)", n)
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// Chat requires a verified account: anonymous sessions and unverified
+// signups get an error frame and nothing is broadcast or persisted.
+// DJ-key holders are exempt.
+func TestChatRequiresVerifiedAccount(t *testing.T) {
+	cases := []struct {
+		desc    string
+		user    *models.User
+		isDJ    bool
+		allowed bool
+	}{
+		{"anonymous session blocked", nil, false, false},
+		{"unverified account blocked", &models.User{ID: "u-1", EmailVerified: false}, false, false},
+		{"verified account allowed", &models.User{ID: "u-2", EmailVerified: true}, false, true},
+		{"anonymous DJ exempt", nil, true, true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.desc, func(t *testing.T) {
+			store := newFakeStore(testRoom(models.RequestPolicyOpen))
+			h := newTestHub(t, store)
+
+			client := NewClient(h, nil, testSession("s-1", "Alice"))
+			client.User = tc.user
+			if tc.user != nil {
+				client.UserID = tc.user.ID
+			}
+			client.IsDJ = tc.isDJ
+			addClient(h, client)
+
+			payload, _ := json.Marshal(ChatPayload{Message: "hello room"})
+			h.Inbound <- &ClientMessage{Client: client, Message: InboundMessage{Action: ActionSendChat, Payload: payload}}
+
+			deadline := time.After(2 * time.Second)
+			for {
+				var frame []byte
+				select {
+				case out := <-client.Send:
+					frame = out.data
+				case <-deadline:
+					t.Fatal("no frame received in response to send_chat")
+				}
+				var msg struct {
+					Event string `json:"event"`
+				}
+				if json.Unmarshal(frame, &msg) != nil {
+					continue
+				}
+				switch msg.Event {
+				case EventChatMessage:
+					if !tc.allowed {
+						t.Fatal("chat was broadcast for a client that should be gated")
+					}
+					return
+				case EventError:
+					if tc.allowed {
+						t.Fatal("chat was rejected for a client that should be allowed")
+					}
+					return
+				}
+			}
+		})
 	}
 }
 

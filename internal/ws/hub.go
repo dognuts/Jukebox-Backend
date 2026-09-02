@@ -658,6 +658,19 @@ func (h *Hub) handleInbound(cm *ClientMessage) {
 
 	switch msg.Action {
 	case ActionSendChat:
+		// Chat requires a verified account. Anonymous listeners and
+		// unverified signups can view and listen only. DJs are exempt:
+		// holding the room's DJ key already proves ownership.
+		if !client.IsDJ {
+			if client.User == nil {
+				client.sendError("create an account and verify your email to join the chat")
+				return
+			}
+			if !client.User.EmailVerified {
+				client.sendError("verify your email address to join the chat")
+				return
+			}
+		}
 		var p ChatPayload
 		if err := json.Unmarshal(msg.Payload, &p); err != nil {
 			client.sendError("invalid chat message")

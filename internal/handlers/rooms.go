@@ -58,6 +58,12 @@ func (h *RoomHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Unverified accounts can view and listen, but not create jukeboxes.
+	if !user.EmailVerified {
+		http.Error(w, "verify your email address to create a jukebox — check your inbox for the verification link", http.StatusForbidden)
+		return
+	}
+
 	var req models.CreateRoomRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid JSON", http.StatusBadRequest)

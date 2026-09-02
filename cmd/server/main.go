@@ -4,8 +4,10 @@ import (
 	"context"
 	"log"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -22,6 +24,26 @@ import (
 	"github.com/jukebox/backend/internal/ws"
 	"github.com/jukebox/backend/internal/youtube"
 )
+
+// hostnamesFromURLs extracts unique lowercase hostnames from a list of
+// URLs/origins (e.g. "https://www.jukebox-app.com" → "www.jukebox-app.com").
+// Entries that don't parse as URLs with a host are skipped.
+func hostnamesFromURLs(urls []string) []string {
+	seen := map[string]bool{}
+	var hosts []string
+	for _, raw := range urls {
+		u, err := neturl.Parse(strings.TrimSpace(raw))
+		if err != nil || u.Hostname() == "" {
+			continue
+		}
+		h := strings.ToLower(u.Hostname())
+		if !seen[h] {
+			seen[h] = true
+			hosts = append(hosts, h)
+		}
+	}
+	return hosts
+}
 
 func main() {
 	cfg := config.Load()
@@ -94,6 +116,22 @@ func main() {
 
 	// ---------- Anti-spam ----------
 
+	// These protections silently no-op when their keys are unset. Warn
+	// unconditionally (not just when ENV=production — a prod deploy that
+	// forgot to set ENV would skip the warning exactly where it matters).
+	// Captcha tokens are only accepted when solved on our own pages —
+	// hostnames derived from CORS_ORIGINS and FRONTEND_URL. This stops
+	// token harvesting (see antispam.VerifyTurnstile).
+	turnstileHosts := hostnamesFromURLs(append([]string{cfg.FrontendURL}, cfg.CORSOrigins...))
+	if cfg.TurnstileSecretKey == "" {
+		log.Println("⚠️⚠️⚠️  TURNSTILE_SECRET_KEY is not set — signup CAPTCHA is DISABLED. Set it (and NEXT_PUBLIC_TURNSTILE_SITE_KEY on the frontend) before serving real traffic. ⚠️⚠️⚠️")
+	} else {
+		log.Printf("✓ Turnstile CAPTCHA enabled (accepted hostnames: %v)", turnstileHosts)
+	}
+	if cfg.ResendAPIKey == "" {
+		log.Println("⚠️⚠️⚠️  RESEND_API_KEY is not set — verification and password-reset emails are NOT delivered (dev mode logs them to console). ⚠️⚠️⚠️")
+	}
+
 	signupLimiter := antispam.NewRateLimiter(redis.Client(), 5) // max 5 signups per IP per hour
 
 	// ---------- Handlers ----------
@@ -102,7 +140,7 @@ func main() {
 	queueH := handlers.NewQueueHandler(pg, redis, hubMgr)
 	sessionH := handlers.NewSessionHandler(redis)
 	wsH := handlers.NewWSHandler(pg, redis, hubMgr, cfg.JWTSecret, cfg.CORSOrigins)
-	authH := handlers.NewAuthHandler(pg, redis, emailSvc, cfg.JWTSecret, cfg.TurnstileSecretKey, signupLimiter)
+	authH := handlers.NewAuthHandler(pg, redis, emailSvc, cfg.JWTSecret, cfg.TurnstileSecretKey, turnstileHosts, signupLimiter)
 	msgH := handlers.NewMessageHandler(pg)
 	plH := handlers.NewPlaylistHandler(pg)
 	djH := handlers.NewDJHandler(pg)
@@ -125,7 +163,10 @@ func main() {
 	r.Use(chimw.Logger)
 	r.Use(chimw.Recoverer)
 	r.Use(chimw.RequestID)
-	r.Use(chimw.RealIP)
+	// NOTE: chimw.RealIP is deliberately NOT used — it rewrites RemoteAddr
+	// from the leftmost X-Forwarded-For / X-Real-IP entry, both of which a
+	// client can spoof. handlers.ClientIP derives the real client IP from
+	// the rightmost (proxy-appended) XFF entry instead.
 	r.Use(middleware.SentryRecover) // capture panics to Sentry
 	r.Use(middleware.SentryMiddleware()) // transaction tracking
 
