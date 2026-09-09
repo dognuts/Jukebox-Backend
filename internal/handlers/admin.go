@@ -411,7 +411,7 @@ func (h *AdminHandler) ListUsers(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, http.StatusOK, users)
+	writeJSON(w, http.StatusOK, newAdminUserViews(users))
 }
 
 // GET /api/admin/users/{id} — get full user details
@@ -425,7 +425,7 @@ func (h *AdminHandler) GetUser(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "user not found", http.StatusNotFound)
 		return
 	}
-	writeJSON(w, http.StatusOK, user)
+	writeJSON(w, http.StatusOK, newAdminUserView(*user))
 }
 
 // PATCH /api/admin/users/{id} — update user fields (ban, verify, set admin, reset neon, etc.)
@@ -457,7 +457,7 @@ func (h *AdminHandler) UpdateUser(w http.ResponseWriter, r *http.Request) {
 		h.pg.AdminSetField(ctx, userID, "is_banned", *req.IsBanned)
 	}
 	if req.EmailVerified != nil {
-		h.pg.AdminSetField(ctx, userID, "email_verified", *req.EmailVerified)
+		h.pg.AdminSetEmailVerified(ctx, userID, *req.EmailVerified)
 	}
 	if req.IsPlus != nil {
 		// AdminSetPlus, not a bare column flip: is_plus is now derived
@@ -479,8 +479,12 @@ func (h *AdminHandler) UpdateUser(w http.ResponseWriter, r *http.Request) {
 	// effect on the target's next request, not after the cache TTL.
 	middleware.InvalidateCachedUser(userID)
 
-	user, _ := h.pg.AdminGetUser(ctx, userID)
-	writeJSON(w, http.StatusOK, user)
+	user, err := h.pg.AdminGetUser(ctx, userID)
+	if err != nil || user == nil {
+		http.Error(w, "user not found", http.StatusNotFound)
+		return
+	}
+	writeJSON(w, http.StatusOK, newAdminUserView(*user))
 }
 
 // DELETE /api/admin/users/{id} — delete a user account
