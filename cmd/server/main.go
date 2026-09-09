@@ -151,7 +151,7 @@ func main() {
 	sessionH := handlers.NewSessionHandler(redis, signupLimiter)
 	wsH := handlers.NewWSHandler(pg, redis, hubMgr, cfg.JWTSecret, cfg.CORSOrigins)
 	wsTicketH := handlers.NewWSTicketHandler(pg, redis, signupLimiter)
-	authH := handlers.NewAuthHandler(pg, redis, emailSvc, cfg.JWTSecret, cfg.TurnstileSecretKey, turnstileHosts, signupLimiter)
+	authH := handlers.NewAuthHandler(pg, redis, emailSvc, cfg.JWTSecret, cfg.TurnstileSecretKey, turnstileHosts, signupLimiter, cfg.VerifyHold)
 	msgH := handlers.NewMessageHandler(pg, signupLimiter)
 	plH := handlers.NewPlaylistHandler(pg)
 	djH := handlers.NewDJHandler(pg)

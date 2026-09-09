@@ -3,6 +3,7 @@ package handlers
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestValidatePassword(t *testing.T) {
@@ -58,5 +59,44 @@ func TestGenerateSecureToken(t *testing.T) {
 
 	if token1 == token2 {
 		t.Error("two generated tokens should not be equal")
+	}
+}
+
+func TestShouldHoldVerification(t *testing.T) {
+	created := time.Date(2026, 9, 7, 15, 25, 23, 0, time.UTC)
+	tests := []struct {
+		desc      string
+		elapsed   time.Duration
+		threshold time.Duration
+		want      bool
+	}{
+		{"bot-speed click is held", 12 * time.Second, 60 * time.Second, true},
+		{"just under threshold is held", 59 * time.Second, 60 * time.Second, true},
+		{"exactly threshold is not held", 60 * time.Second, 60 * time.Second, false},
+		{"human-speed click is not held", 30 * time.Minute, 60 * time.Second, false},
+		{"threshold 0 disables hold", 1 * time.Second, 0, false},
+		{"clock skew (negative elapsed) is held", -2 * time.Second, 60 * time.Second, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.desc, func(t *testing.T) {
+			got := shouldHoldVerification(created, created.Add(tt.elapsed), tt.threshold)
+			if got != tt.want {
+				t.Errorf("shouldHoldVerification(elapsed=%v, threshold=%v) = %v, want %v", tt.elapsed, tt.threshold, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestTruncateUserAgent(t *testing.T) {
+	short := "Mozilla/5.0"
+	if got := truncateUserAgent(short); got != short {
+		t.Errorf("short UA changed: %q", got)
+	}
+	long := strings.Repeat("x", 600)
+	if got := truncateUserAgent(long); len(got) != maxUserAgentLen {
+		t.Errorf("long UA len = %d, want %d", len(got), maxUserAgentLen)
+	}
+	if got := truncateUserAgent(""); got != "" {
+		t.Errorf("empty UA = %q, want empty", got)
 	}
 }

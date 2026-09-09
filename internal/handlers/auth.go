@@ -31,10 +31,31 @@ type AuthHandler struct {
 	turnstileSecret    string
 	turnstileHostnames []string // hostnames captcha tokens may be solved on
 	signupRateLimiter  *antispam.RateLimiter
+	verifyHold         time.Duration // see config.VerifyHold
 }
 
-func NewAuthHandler(pg *store.PGStore, redis *store.RedisStore, emailSvc *email.Service, jwtSecret string, turnstileSecret string, turnstileHostnames []string, rateLimiter *antispam.RateLimiter) *AuthHandler {
-	return &AuthHandler{pg: pg, redis: redis, emailSvc: emailSvc, jwtSecret: jwtSecret, turnstileSecret: turnstileSecret, turnstileHostnames: turnstileHostnames, signupRateLimiter: rateLimiter}
+func NewAuthHandler(pg *store.PGStore, redis *store.RedisStore, emailSvc *email.Service, jwtSecret string, turnstileSecret string, turnstileHostnames []string, rateLimiter *antispam.RateLimiter, verifyHold time.Duration) *AuthHandler {
+	return &AuthHandler{pg: pg, redis: redis, emailSvc: emailSvc, jwtSecret: jwtSecret, turnstileSecret: turnstileSecret, turnstileHostnames: turnstileHostnames, signupRateLimiter: rateLimiter, verifyHold: verifyHold}
+}
+
+// maxUserAgentLen bounds what we store from the User-Agent header.
+const maxUserAgentLen = 512
+
+func truncateUserAgent(ua string) string {
+	if len(ua) > maxUserAgentLen {
+		return ua[:maxUserAgentLen]
+	}
+	return ua
+}
+
+// shouldHoldVerification decides whether an email-verification click is
+// fast enough to look automated. Anything under the threshold, including a
+// negative elapsed time from clock skew, is held. threshold <= 0 disables.
+func shouldHoldVerification(createdAt, now time.Time, threshold time.Duration) bool {
+	if threshold <= 0 {
+		return false
+	}
+	return now.Sub(createdAt) < threshold
 }
 
 // POST /api/auth/signup
@@ -167,6 +188,8 @@ func (h *AuthHandler) Signup(w http.ResponseWriter, r *http.Request) {
 		StageName:      req.StageName,
 		CreatedAt:      time.Now(),
 		UpdatedAt:      time.Now(),
+		SignupIP:        ip,
+		SignupUserAgent: truncateUserAgent(r.Header.Get("User-Agent")),
 	}
 
 	if err := h.pg.CreateUser(ctx, user); err != nil {
@@ -473,7 +496,23 @@ func (h *AuthHandler) VerifyEmail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.pg.MarkEmailVerificationUsed(ctx, v.ID, ClientIP(r))
+	ip := ClientIP(r)
+	h.pg.MarkEmailVerificationUsed(ctx, v.ID, ip)
+
+	user, err := h.pg.GetUserByID(ctx, v.UserID)
+	if err != nil || user == nil {
+		http.Error(w, "invalid verification token", http.StatusBadRequest)
+		return
+	}
+	if shouldHoldVerification(user.CreatedAt, time.Now(), h.verifyHold) {
+		// Bot-speed click. Park the account and return the normal success
+		// body so the operator doesn't learn what tripped it (same idea as
+		// the signup honeypot). Admins release from the users page.
+		log.Printf("[antispam] fast verify held: user=%s elapsed=%s ip=%s", user.ID, time.Since(user.CreatedAt).Round(time.Second), ip)
+		h.pg.HoldEmailVerification(ctx, user.ID)
+		writeJSON(w, http.StatusOK, map[string]string{"status": "email verified"})
+		return
+	}
 	h.pg.SetEmailVerified(ctx, v.UserID)
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "email verified"})
