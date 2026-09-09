@@ -143,6 +143,12 @@ type User struct {
 	NeonBalance    int       `json:"neonBalance"`
 	StripeCustomerID string  `json:"-"`
 	IsBanned         bool    `json:"isBanned"`
+	// Signup forensics: admin-only. json:"-" keeps them out of /api/auth/me
+	// and profile responses; the admin handler copies them into its own view.
+	SignupIP        string     `json:"-"`
+	SignupUserAgent string     `json:"-"`
+	VerifiedAt      *time.Time `json:"-"`
+	VerifyHeldAt    *time.Time `json:"-"`
 }
 
 type EmailVerification struct {

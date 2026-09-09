@@ -13,10 +13,11 @@ import (
 
 func (s *PGStore) CreateUser(ctx context.Context, user *models.User) error {
 	_, err := s.pool.Exec(ctx, `
-		INSERT INTO users (id, email, email_verified, password_hash, display_name, avatar_color, avatar_url, bio, favorite_genres, created_at, updated_at, stage_name)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+		INSERT INTO users (id, email, email_verified, password_hash, display_name, avatar_color, avatar_url, bio, favorite_genres, created_at, updated_at, stage_name, signup_ip, signup_user_agent)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
 		user.ID, user.Email, user.EmailVerified, user.PasswordHash, user.DisplayName,
 		user.AvatarColor, user.AvatarURL, user.Bio, user.FavoriteGenres, user.CreatedAt, user.UpdatedAt, user.StageName,
+		user.SignupIP, user.SignupUserAgent,
 	)
 	return err
 }
@@ -25,11 +26,13 @@ func (s *PGStore) GetUserByEmail(ctx context.Context, email string) (*models.Use
 	u := &models.User{}
 	err := s.pool.QueryRow(ctx, `
 		SELECT id, email, email_verified, password_hash, display_name, avatar_color, avatar_url, bio, favorite_genres, created_at, updated_at, is_admin, city, region, country, stage_name,
-		       (is_plus AND (plus_expires_at IS NULL OR plus_expires_at > NOW())) AS is_plus, plus_since, plus_expires_at, neon_balance, stripe_customer_id, is_banned
+		       (is_plus AND (plus_expires_at IS NULL OR plus_expires_at > NOW())) AS is_plus, plus_since, plus_expires_at, neon_balance, stripe_customer_id, is_banned,
+		       signup_ip, signup_user_agent, verified_at, verify_held_at
 		FROM users WHERE email = $1`, email,
 	).Scan(&u.ID, &u.Email, &u.EmailVerified, &u.PasswordHash, &u.DisplayName,
 		&u.AvatarColor, &u.AvatarURL, &u.Bio, &u.FavoriteGenres, &u.CreatedAt, &u.UpdatedAt, &u.IsAdmin, &u.City, &u.Region, &u.Country, &u.StageName,
-		&u.IsPlus, &u.PlusSince, &u.PlusExpiresAt, &u.NeonBalance, &u.StripeCustomerID, &u.IsBanned)
+		&u.IsPlus, &u.PlusSince, &u.PlusExpiresAt, &u.NeonBalance, &u.StripeCustomerID, &u.IsBanned,
+		&u.SignupIP, &u.SignupUserAgent, &u.VerifiedAt, &u.VerifyHeldAt)
 	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
@@ -40,11 +43,13 @@ func (s *PGStore) GetUserByID(ctx context.Context, id string) (*models.User, err
 	u := &models.User{}
 	err := s.pool.QueryRow(ctx, `
 		SELECT id, email, email_verified, password_hash, display_name, avatar_color, avatar_url, bio, favorite_genres, created_at, updated_at, is_admin, city, region, country, stage_name,
-		       (is_plus AND (plus_expires_at IS NULL OR plus_expires_at > NOW())) AS is_plus, plus_since, plus_expires_at, neon_balance, stripe_customer_id, is_banned
+		       (is_plus AND (plus_expires_at IS NULL OR plus_expires_at > NOW())) AS is_plus, plus_since, plus_expires_at, neon_balance, stripe_customer_id, is_banned,
+		       signup_ip, signup_user_agent, verified_at, verify_held_at
 		FROM users WHERE id = $1`, id,
 	).Scan(&u.ID, &u.Email, &u.EmailVerified, &u.PasswordHash, &u.DisplayName,
 		&u.AvatarColor, &u.AvatarURL, &u.Bio, &u.FavoriteGenres, &u.CreatedAt, &u.UpdatedAt, &u.IsAdmin, &u.City, &u.Region, &u.Country, &u.StageName,
-		&u.IsPlus, &u.PlusSince, &u.PlusExpiresAt, &u.NeonBalance, &u.StripeCustomerID, &u.IsBanned)
+		&u.IsPlus, &u.PlusSince, &u.PlusExpiresAt, &u.NeonBalance, &u.StripeCustomerID, &u.IsBanned,
+		&u.SignupIP, &u.SignupUserAgent, &u.VerifiedAt, &u.VerifyHeldAt)
 	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
@@ -70,8 +75,21 @@ func (s *PGStore) UpdateUserEmail(ctx context.Context, userID, email string) err
 	return err
 }
 
+// SetEmailVerified marks the account verified, stamps verified_at (first
+// click only), and clears any fast-verify hold.
 func (s *PGStore) SetEmailVerified(ctx context.Context, userID string) error {
-	_, err := s.pool.Exec(ctx, `UPDATE users SET email_verified = TRUE, updated_at = NOW() WHERE id = $1`, userID)
+	_, err := s.pool.Exec(ctx, `UPDATE users
+		SET email_verified = TRUE, verified_at = COALESCE(verified_at, NOW()), verify_held_at = NULL, updated_at = NOW()
+		WHERE id = $1`, userID)
+	return err
+}
+
+// HoldEmailVerification records that a verification click was suspiciously
+// fast. The account stays unverified until an admin releases it.
+func (s *PGStore) HoldEmailVerification(ctx context.Context, userID string) error {
+	_, err := s.pool.Exec(ctx, `UPDATE users
+		SET verified_at = COALESCE(verified_at, NOW()), verify_held_at = NOW(), updated_at = NOW()
+		WHERE id = $1`, userID)
 	return err
 }
 
@@ -109,8 +127,8 @@ func (s *PGStore) GetEmailVerificationByToken(ctx context.Context, token string)
 	return v, err
 }
 
-func (s *PGStore) MarkEmailVerificationUsed(ctx context.Context, id string) error {
-	_, err := s.pool.Exec(ctx, `UPDATE email_verifications SET used_at = NOW() WHERE id = $1`, id)
+func (s *PGStore) MarkEmailVerificationUsed(ctx context.Context, id, ip string) error {
+	_, err := s.pool.Exec(ctx, `UPDATE email_verifications SET used_at = NOW(), used_ip = $2 WHERE id = $1`, id, ip)
 	return err
 }
 
@@ -222,14 +240,16 @@ func (s *PGStore) AdminListUsers(ctx context.Context, query string) ([]models.Us
 	var args []interface{}
 	if query != "" {
 		sql = `SELECT id, email, display_name, stage_name, avatar_color, bio, city, region, country,
-			email_verified, is_admin, is_plus, neon_balance, created_at, is_banned
+			email_verified, is_admin, is_plus, neon_balance, created_at, is_banned,
+			signup_ip, signup_user_agent, verified_at, verify_held_at
 			FROM users
 			WHERE email ILIKE $1 OR display_name ILIKE $1 OR stage_name ILIKE $1
 			ORDER BY created_at DESC LIMIT 100`
 		args = []interface{}{"%" + query + "%"}
 	} else {
 		sql = `SELECT id, email, display_name, stage_name, avatar_color, bio, city, region, country,
-			email_verified, is_admin, is_plus, neon_balance, created_at, is_banned
+			email_verified, is_admin, is_plus, neon_balance, created_at, is_banned,
+			signup_ip, signup_user_agent, verified_at, verify_held_at
 			FROM users
 			ORDER BY created_at DESC LIMIT 100`
 	}
@@ -245,7 +265,8 @@ func (s *PGStore) AdminListUsers(ctx context.Context, query string) ([]models.Us
 		var isBanned bool
 		err := rows.Scan(&u.ID, &u.Email, &u.DisplayName, &u.StageName, &u.AvatarColor,
 			&u.Bio, &u.City, &u.Region, &u.Country,
-			&u.EmailVerified, &u.IsAdmin, &u.IsPlus, &u.NeonBalance, &u.CreatedAt, &isBanned)
+			&u.EmailVerified, &u.IsAdmin, &u.IsPlus, &u.NeonBalance, &u.CreatedAt, &isBanned,
+			&u.SignupIP, &u.SignupUserAgent, &u.VerifiedAt, &u.VerifyHeldAt)
 		if err != nil {
 			return nil, err
 		}
@@ -261,11 +282,13 @@ func (s *PGStore) AdminGetUser(ctx context.Context, userID string) (*models.User
 	var isBanned bool
 	err := s.pool.QueryRow(ctx,
 		`SELECT id, email, display_name, stage_name, avatar_color, bio, city, region, country,
-			email_verified, is_admin, is_plus, neon_balance, created_at, is_banned
+			email_verified, is_admin, is_plus, neon_balance, created_at, is_banned,
+			signup_ip, signup_user_agent, verified_at, verify_held_at
 		FROM users WHERE id = $1`, userID).Scan(
 		&u.ID, &u.Email, &u.DisplayName, &u.StageName, &u.AvatarColor,
 		&u.Bio, &u.City, &u.Region, &u.Country,
-		&u.EmailVerified, &u.IsAdmin, &u.IsPlus, &u.NeonBalance, &u.CreatedAt, &isBanned)
+		&u.EmailVerified, &u.IsAdmin, &u.IsPlus, &u.NeonBalance, &u.CreatedAt, &isBanned,
+			&u.SignupIP, &u.SignupUserAgent, &u.VerifiedAt, &u.VerifyHeldAt)
 	if err != nil {
 		return nil, err
 	}
@@ -285,6 +308,18 @@ func (s *PGStore) AdminSetField(ctx context.Context, userID, field string, value
 	}
 	_, err := s.pool.Exec(ctx,
 		`UPDATE users SET `+field+` = $2 WHERE id = $1`, userID, value)
+	return err
+}
+
+// AdminSetEmailVerified flips the flag by hand. Verifying also releases a
+// fast-verify hold; un-verifying leaves verified_at alone (it records the
+// click, not the flag).
+func (s *PGStore) AdminSetEmailVerified(ctx context.Context, userID string, verified bool) error {
+	if verified {
+		_, err := s.pool.Exec(ctx, `UPDATE users SET email_verified = TRUE, verify_held_at = NULL WHERE id = $1`, userID)
+		return err
+	}
+	_, err := s.pool.Exec(ctx, `UPDATE users SET email_verified = FALSE WHERE id = $1`, userID)
 	return err
 }
 

@@ -473,7 +473,7 @@ func (h *AuthHandler) VerifyEmail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.pg.MarkEmailVerificationUsed(ctx, v.ID)
+	h.pg.MarkEmailVerificationUsed(ctx, v.ID, ClientIP(r))
 	h.pg.SetEmailVerified(ctx, v.UserID)
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "email verified"})
