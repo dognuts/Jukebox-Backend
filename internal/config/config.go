@@ -35,6 +35,10 @@ type Config struct {
 	// ENV defaults to "development" when unset, so keying free purchases
 	// off it would FAIL OPEN on any deploy that forgot to set ENV.
 	DevPayments bool
+	// VerifyHold: email verifications that arrive sooner than this after
+	// signup are held for admin review instead of verifying. Bots verify in
+	// 12-19s; the fastest human on record took 17 minutes. 0 disables.
+	VerifyHold time.Duration
 }
 
 func Load() *Config {
@@ -69,7 +73,24 @@ func Load() *Config {
 		SentryDSN:          getEnv("SENTRY_DSN", ""),
 		YouTubeDataAPIKey:  getEnv("YOUTUBE_DATA_API_KEY", ""),
 		DevPayments:        getEnv("DEV_PAYMENTS", "") == "true",
+		VerifyHold:         verifyHoldFromEnv(),
 	}
+}
+
+const defaultVerifyHoldSeconds = 60
+
+// verifyHoldFromEnv parses VERIFY_HOLD_SECONDS. Unset, non-numeric, or
+// negative values fall back to the default; 0 disables the hold.
+func verifyHoldFromEnv() time.Duration {
+	raw := getEnv("VERIFY_HOLD_SECONDS", "")
+	if raw == "" {
+		return defaultVerifyHoldSeconds * time.Second
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 0 {
+		return defaultVerifyHoldSeconds * time.Second
+	}
+	return time.Duration(n) * time.Second
 }
 
 func getEnv(key, fallback string) string {
