@@ -327,3 +327,100 @@ func TestRunMigrationsStrictAfterCutoff(t *testing.T) {
 		t.Error("failed post-cutoff migration was recorded as applied")
 	}
 }
+
+// TestMigration015BackfillsVerifiedAt: 015 must copy the newest used
+// verification token's used_at onto users.verified_at, for verified AND
+// admin-unverified users, and must ignore tokens that were only marked
+// used by a resend (older token) — the newest row per user wins.
+func TestMigration015BackfillsVerifiedAt(t *testing.T) {
+	s := newMigrationTestDB(t)
+	ctx := context.Background()
+
+	// Apply everything before 015 from a temp copy of the migrations dir.
+	pre := t.TempDir()
+	files, err := listUpMigrations(testMigrationsDir)
+	if err != nil {
+		t.Fatalf("listUpMigrations: %v", err)
+	}
+	for _, f := range files {
+		if f >= "015" {
+			break
+		}
+		b, err := os.ReadFile(filepath.Join(testMigrationsDir, f))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(pre, f), b, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.RunMigrations(ctx, pre); err != nil {
+		t.Fatalf("RunMigrations pre-015: %v", err)
+	}
+
+	base := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	mustExec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := s.pool.Exec(ctx, sql, args...); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	// u1: verified, resent once. Old token marked used at resend (+5s),
+	// new token used at +15s. Backfill must pick +15s.
+	mustExec(`INSERT INTO users (id, email, password_hash, display_name, avatar_color, created_at, updated_at, email_verified)
+	          VALUES ('u1','u1@x.com','h','u1','c',$1,$1,TRUE)`, base)
+	mustExec(`INSERT INTO email_verifications (id, user_id, token, expires_at, used_at, created_at)
+	          VALUES ('t1a','u1','tok1a',$1,$2,$3)`, base.Add(24*time.Hour), base.Add(5*time.Second), base)
+	mustExec(`INSERT INTO email_verifications (id, user_id, token, expires_at, used_at, created_at)
+	          VALUES ('t1b','u1','tok1b',$1,$2,$3)`, base.Add(24*time.Hour), base.Add(15*time.Second), base.Add(5*time.Second))
+	// u2: admin un-verified later, but token was used at +20m. Still backfilled.
+	mustExec(`INSERT INTO users (id, email, password_hash, display_name, avatar_color, created_at, updated_at, email_verified)
+	          VALUES ('u2','u2@x.com','h','u2','c',$1,$1,FALSE)`, base)
+	mustExec(`INSERT INTO email_verifications (id, user_id, token, expires_at, used_at, created_at)
+	          VALUES ('t2','u2','tok2',$1,$2,$3)`, base.Add(24*time.Hour), base.Add(20*time.Minute), base)
+	// u3: never clicked. verified_at stays NULL.
+	mustExec(`INSERT INTO users (id, email, password_hash, display_name, avatar_color, created_at, updated_at, email_verified)
+	          VALUES ('u3','u3@x.com','h','u3','c',$1,$1,FALSE)`, base)
+	mustExec(`INSERT INTO email_verifications (id, user_id, token, expires_at, created_at)
+	          VALUES ('t3','u3','tok3',$1,$2)`, base.Add(24*time.Hour), base)
+
+	if err := s.RunMigrations(ctx, testMigrationsDir); err != nil {
+		t.Fatalf("RunMigrations full: %v", err)
+	}
+	if !migrationRecorded(t, s, "015_signup_forensics.up.sql") {
+		t.Fatal("015 not recorded")
+	}
+
+	got := map[string]*time.Time{}
+	rows, err := s.pool.Query(ctx, `SELECT id, verified_at FROM users ORDER BY id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		var v *time.Time
+		if err := rows.Scan(&id, &v); err != nil {
+			t.Fatal(err)
+		}
+		got[id] = v
+	}
+	want := map[string]*time.Time{
+		"u1": ptrTime(base.Add(15 * time.Second)),
+		"u2": ptrTime(base.Add(20 * time.Minute)),
+		"u3": nil,
+	}
+	for id, w := range want {
+		g := got[id]
+		switch {
+		case w == nil && g != nil:
+			t.Errorf("%s: verified_at = %v, want NULL", id, *g)
+		case w != nil && g == nil:
+			t.Errorf("%s: verified_at = NULL, want %v", id, *w)
+		case w != nil && g != nil && !g.Equal(*w):
+			t.Errorf("%s: verified_at = %v, want %v", id, *g, *w)
+		}
+	}
+}
+
+func ptrTime(t time.Time) *time.Time { return &t }
